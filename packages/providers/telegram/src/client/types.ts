@@ -83,6 +83,20 @@ export interface TgMediaRef {
   summary?: string;
 }
 
+/** Which message's media to download, and the file id the archive last saw for it. */
+export interface TgMediaDownload {
+  chatId: number;
+  msgId: number;
+  fileId: string;
+  size?: number;
+}
+
+export interface TgDownloaded {
+  data: Uint8Array;
+  /** The message's media as Telegram describes it now, when the reference was refreshed. */
+  refreshed?: TgMediaRef;
+}
+
 export interface TgMessage {
   chatId: number;
   id: number;
@@ -201,10 +215,16 @@ export interface TelegramAdapter {
   getMessages(chatId: number, ids: number[]): Promise<(TgMessage | null)[]>;
   /** Messages by id in the common box, which needs no peer. */
   getMessagesCommon(ids: number[]): Promise<(TgMessage | null)[]>;
-  download(
-    media: TgMediaRef,
+  /**
+   * Download one message's media, at most `maxBytes` (a larger file fails as
+   * `forbidden`). A stale file reference is refreshed by fetching the message
+   * again and retrying once; the fresh descriptor comes back as `refreshed` so
+   * the caller can store it. A message that is gone fails as `not-found`.
+   */
+  downloadMedia(
+    target: TgMediaDownload,
     opts: { maxBytes: number; signal?: AbortSignal },
-  ): Promise<Uint8Array>;
+  ): Promise<TgDownloaded>;
   /** Phase 4. */
   iterForumTopics(chatId: number): AsyncIterable<{ id: number; title: string }>;
 }

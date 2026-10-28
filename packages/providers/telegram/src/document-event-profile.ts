@@ -9,8 +9,9 @@
  * addresses and phone numbers in the day's text that belong to nobody in it
  * are `mentioned`.
  *
- * `attachment` joins the document types with media extraction (phase 3): a
- * type the source never emits would compile conditions that can never fire.
+ * An `attachment` document is a photo's OCR text or a document's extracted
+ * text, a child of the day it was sent on. The chat fields below describe
+ * the conversation; an attachment carries the shared attachment metadata.
  */
 
 import type { DocumentEventProfile } from "@omnesis/source-sdk";
@@ -18,7 +19,7 @@ import type { DocumentEventProfile } from "@omnesis/source-sdk";
 export const CHAT_KINDS = ["private", "saved", "group", "supergroup", "forum", "channel"] as const;
 
 export const telegramDocumentEventProfile: DocumentEventProfile = {
-  documentTypes: ["conversation"],
+  documentTypes: ["conversation", "attachment"],
   personRoles: ["participant", "mentioned"],
   metadataFields: [
     {

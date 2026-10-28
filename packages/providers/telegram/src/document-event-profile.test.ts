@@ -8,6 +8,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { resolveAttachmentConfig } from "@omnesis/core";
 import { validateDocumentEventProfile } from "@omnesis/source-sdk";
 import { CHAT_KINDS } from "./document-event-profile.js";
 import {
@@ -58,31 +59,46 @@ describe("telegram documentEventProfile", () => {
   let docs: Map<string, DocumentInput>;
 
   beforeAll(async () => {
-    rig = await syncRig({
-      users: [JAMIE, DAVID],
-      chats: [
-        {
-          chat: GROUP,
-          messages: [
-            messageIn(GROUP, 1, T0, "Ping David Lin on +1 202-555-0188 about the booking", {
-              senderId: JAMIE.id,
-            }),
-            messageIn(GROUP, 2, T0 + 60, "floor plan", {
-              senderId: DAVID.id,
-              media: { kind: "photo", fileId: "f1", isViewOnce: false },
-            }),
-          ],
-        },
-        {
-          chat: JAMIE_CHAT,
-          messages: [
-            messageIn(JAMIE_CHAT, 3, T0, "Invoice goes to billing@example.com", {
-              senderId: JAMIE.id,
-            }),
-          ],
-        },
-      ],
-    });
+    rig = await syncRig(
+      {
+        users: [JAMIE, DAVID],
+        chats: [
+          {
+            chat: GROUP,
+            messages: [
+              messageIn(GROUP, 1, T0, "Ping David Lin on +1 202-555-0188 about the booking", {
+                senderId: JAMIE.id,
+              }),
+              messageIn(GROUP, 2, T0 + 60, "floor plan", {
+                senderId: DAVID.id,
+                media: {
+                  kind: "photo",
+                  fileId: "f1",
+                  mimeType: "image/jpeg",
+                  size: 2048,
+                  isViewOnce: false,
+                },
+              }),
+            ],
+          },
+          {
+            chat: JAMIE_CHAT,
+            messages: [
+              messageIn(JAMIE_CHAT, 3, T0, "Invoice goes to billing@example.com", {
+                senderId: JAMIE.id,
+              }),
+            ],
+          },
+        ],
+      },
+      {
+        attachmentConfig: resolveAttachmentConfig(undefined, { defaultEnabled: true }),
+        // The host's OCR, stubbed: no model runs.
+        extractAttachment: () =>
+          Promise.resolve({ text: "Room 4 is the studio, call +1 202-555-0177", truncated: false }),
+      },
+    );
+    rig.sim.setMedia("f1", new TextEncoder().encode("floor plan scan"));
     docs = latestDocs((await syncAll(rig.source, null)).pages);
   });
 
@@ -92,6 +108,8 @@ describe("telegram documentEventProfile", () => {
 
   const group = (): DocumentInput => docs.get(`${GROUP.id}:2026-03-10`)!;
   const oneToOne = (): DocumentInput => docs.get(`${JAMIE.id}:2026-03-10`)!;
+  const attachment = (): DocumentInput =>
+    [...docs.values()].find((d) => d.metadata.documentType === "attachment")!;
 
   it("satisfies the source-boundary contract", () => {
     expect(() => validateDocumentEventProfile(profile, "provider-telegram")).not.toThrow();
@@ -129,6 +147,13 @@ describe("telegram documentEventProfile", () => {
     expect(profile.metadataFields?.find((f) => f.path === "extra.chatKind")?.allowedValues).toEqual(
       [...CHAT_KINDS],
     );
+  });
+
+  it("emits the photo's text as an attachment of the day, with its people", () => {
+    expect(attachment().metadata.extra?.parentExternalId).toBe(group().externalId);
+    // Mentions are scoped to the file; participants come from the day.
+    const roles = new Set((attachment().metadata.people ?? []).map((p) => p.role));
+    expect([...roles].every((r) => profile.personRoles?.includes(r))).toBe(true);
   });
 
   it("counts messages and media", () => {

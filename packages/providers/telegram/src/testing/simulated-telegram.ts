@@ -16,11 +16,18 @@
  * The corpus is the server's state: `pushNew`, `pushEdit` and `pushDelete`
  * change it and deliver the matching live update, so a later history read
  * agrees with what the updates said — unless `dropUpdates` lost them, which
- * is how a test makes a gap. Media downloads arrive with phase 3.
+ * is how a test makes a gap.
+ *
+ * Media bytes live beside the corpus, by file id (`setMedia`). A file id
+ * whose reference `expireReference` made stale answers
+ * `FILE_REFERENCE_EXPIRED` while the message itself already names a fresh
+ * one, so a download recovers only by fetching the message again, as it must
+ * against Telegram.
  */
 
 import { writeProviderCredentials } from "@omnesis/core";
 import { TELEGRAM_FILE_KEY } from "../credentials-spec.js";
+import { downloadWithReferenceRefresh } from "../client/download.js";
 import { writeSessionRecord } from "../session-store.js";
 import {
   TelegramError,
@@ -33,6 +40,8 @@ import {
   type TelegramAuthAdapter,
   type TgChat,
   type TgDialog,
+  type TgDownloaded,
+  type TgMediaDownload,
   type TgMediaRef,
   type TgMessage,
   type TgUpdate,
@@ -94,6 +103,8 @@ export class SimulatedTelegram {
   private qrCounter = 0;
   private pendingLogin: { waiter: Waiter; scannedBy?: number; rotate: () => void } | undefined;
   private droppedUpdates = 0;
+  private readonly media = new Map<string, Uint8Array | "expired" | "gone">();
+  private referenceGeneration = 0;
 
   constructor(corpus: SimulatedCorpus) {
     this.addAccount(corpus);
@@ -324,6 +335,44 @@ export class SimulatedTelegram {
     const index = entry.messages.findIndex((m) => m.id === id);
     if (index < 0) throw new Error(`No simulated message ${id} in chat ${chatId}`);
     entry.messages[index] = { ...entry.messages[index]!, text, editDate };
+  }
+
+  /** Serve `bytes` for `fileId`, or make it `gone` (Telegram no longer has the file). */
+  setMedia(fileId: string, bytes: Uint8Array | "gone"): void {
+    this.media.set(fileId, bytes);
+  }
+
+  /**
+   * Let a message's file reference go stale: its old file id answers
+   * `FILE_REFERENCE_EXPIRED`, and the message, fetched again, names a fresh
+   * file id serving the same bytes. Returns the fresh id.
+   */
+  expireReference(chatId: number, msgId: number, ownerId?: number): string {
+    const entry = this.chatEntry(this.ownerAccount(ownerId), chatId);
+    const index = entry.messages.findIndex((m) => m.id === msgId);
+    const message = entry.messages[index];
+    const oldId = message?.media?.fileId;
+    if (!message || !oldId) throw new Error(`No simulated media on message ${msgId}`);
+    const bytes = this.media.get(oldId);
+    const freshId = `${oldId.split("~")[0]}~ref${++this.referenceGeneration}`;
+    if (bytes !== undefined) this.media.set(freshId, bytes);
+    this.media.set(oldId, "expired");
+    entry.messages[index] = { ...message, media: { ...message.media!, fileId: freshId } };
+    return freshId;
+  }
+
+  /** @internal The bytes behind a file id, or the error Telegram would answer. */
+  fileBytes(fileId: string): Uint8Array {
+    const bytes = this.media.get(fileId);
+    if (bytes === "expired") {
+      throw new TelegramError("file-reference-expired", "FILE_REFERENCE_EXPIRED", {
+        rpc: "FILE_REFERENCE_EXPIRED",
+      });
+    }
+    if (bytes === undefined || bytes === "gone") {
+      throw new TelegramError("not-found", "FILE_ID_INVALID", { rpc: "FILE_ID_INVALID" });
+    }
+    return bytes;
   }
 
   private ownerAccount(ownerId: number | undefined): SimulatedCorpus {
@@ -566,10 +615,22 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
     );
   }
 
-  download(_media: TgMediaRef): Promise<Uint8Array> {
-    return this.request("download", () => {
-      this.authorizeCurrent();
-      throw new TelegramError("not-found", "No simulated media");
+  downloadMedia(
+    target: TgMediaDownload,
+    opts: { maxBytes: number; signal?: AbortSignal },
+  ): Promise<TgDownloaded> {
+    return downloadWithReferenceRefresh(target, opts.maxBytes, {
+      download: (fileId) =>
+        this.request(
+          "download",
+          () => {
+            opts.signal?.throwIfAborted();
+            this.authorizeCurrent();
+            return this.server.fileBytes(fileId);
+          },
+          { chatId: target.chatId, msgId: target.msgId, fileId },
+        ),
+      refetch: async (chatId, msgId) => (await this.getMessages(chatId, [msgId]))[0] ?? null,
     });
   }
 

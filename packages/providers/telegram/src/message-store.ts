@@ -28,18 +28,28 @@
 
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { normalizePhone } from "@omnesis/core";
+import { TRANSCRIBER_UNAVAILABLE, createLogger, normalizePhone } from "@omnesis/core";
 import { openProtectedDatabase, inspectProtectedStore, type Db } from "./protected-store.js";
 import { EXTRACT_REVISION } from "./message-extractor.js";
 import { PENDING_DELETION_TTL_DAYS } from "./limits.js";
+import {
+  backoffStep,
+  downloadRetryDelaySec,
+  isProcessableKind,
+  type MediaOutcome,
+  type MediaState,
+} from "./media-retry.js";
+import type { ExtractionResult } from "@omnesis/core";
 import type { LocalStoreProbeResult } from "@omnesis/source-sdk";
 import type { ChatKind, MessageBox, TgChat, TgDialog, TgUser } from "./client/types.js";
 import type { MediaDescriptor, StoredChat, StoredMessage, WalkState } from "./types.js";
 
+const log = createLogger("source:telegram-messages").child("store");
+
 const ARCHIVE_FILE = "archive.db";
 const ARCHIVE_LABEL = "Telegram message archive";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -98,9 +108,11 @@ CREATE TABLE IF NOT EXISTS messages (
   media_next_attempt INTEGER,
   media_last_error TEXT,
   extract_rev INTEGER NOT NULL DEFAULT 0,
+  media_extract_json TEXT,
   PRIMARY KEY (chat_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS messages_by_chat_ts ON messages(chat_id, ts);
+CREATE INDEX IF NOT EXISTS messages_media_retry ON messages(media_state, media_next_attempt);
 CREATE UNIQUE INDEX IF NOT EXISTS messages_by_box_id ON messages(box, msg_id);
 
 CREATE TABLE IF NOT EXISTS pending_deletions (
@@ -135,7 +147,7 @@ CREATE TABLE IF NOT EXISTS topics (
 );
 `;
 
-/** Columns schema 2 added, for an archive the first schema created. */
+/** Columns later schemas added, for an archive an earlier one created. */
 const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]> = [
   ["chats", "last_message_ts", "INTEGER NOT NULL DEFAULT 0"],
   ["chats", "reconcile_offset_id", "INTEGER"],
@@ -144,7 +156,40 @@ const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]
   ["users", "is_deleted", "INTEGER NOT NULL DEFAULT 0"],
   ["messages", "extract_rev", "INTEGER NOT NULL DEFAULT 0"],
   ["emitted_attachments", "retired_seq", "INTEGER"],
+  ["messages", "media_extract_json", "TEXT"],
 ];
+
+/** The media kinds a message is enrolled in the media lifecycle for (`media-retry.ts`). */
+const PROCESSABLE_KINDS_SQL = "'voice', 'photo', 'document'";
+
+/** `media_json`'s kind, tolerating a row whose JSON does not parse. */
+const MEDIA_KIND_SQL =
+  "json_extract(CASE WHEN json_valid(media_json) THEN media_json ELSE '{}' END, '$.kind')";
+
+/**
+ * Media a page may attempt: pending, scheduled, surviving, inside the cutoff,
+ * and of a kind this source can process right now. Shared by the sweep, the
+ * due check, the wake time and the health counts.
+ */
+const MEDIA_RETRY_ELIGIBILITY = `
+  media_state = 'pending' AND media_next_attempt IS NOT NULL AND deleted = 0
+  AND (@minTs IS NULL OR ts >= @minTs)
+  AND ((@voiceNotes = 1 AND ${MEDIA_KIND_SQL} = 'voice')
+    OR (@attachments = 1 AND ${MEDIA_KIND_SQL} IN ('photo', 'document')))`;
+
+/** Which media this source processes; set from what its host offers. */
+export interface MediaScope {
+  voiceNotes: boolean;
+  attachments: boolean;
+  /** Unix seconds; older media is never attempted or counted. */
+  minTs?: number;
+}
+
+/** Media still to process, or gone for good, voice notes apart from attachments. */
+export interface MediaHealthStats {
+  voiceNotes: { pending: number; transcriberUnavailable: number; unavailable: number };
+  attachments: { pending: number; unavailable: number };
+}
 
 export interface ArchiveOptions {
   /** Clock, in unix seconds. */
@@ -243,6 +288,11 @@ interface MessageRow {
   grouped_id: string | null;
   service: string | null;
   media_json: string | null;
+  media_state: string | null;
+  media_next_attempt: number | null;
+  media_last_error: string | null;
+  transcript: string | null;
+  media_extract_json: string | null;
 }
 
 /** The UTC calendar day a unix-seconds timestamp falls on, `YYYY-MM-DD`. */
@@ -263,6 +313,8 @@ export class TelegramArchive {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     db.exec(SCHEMA);
     this.addMissingColumns();
+    const priorVersion = Number(this.getMeta("schema_version") ?? SCHEMA_VERSION);
+    if (priorVersion < 3) this.enrollArchivedMedia();
     db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('store_id', ?)").run(randomUUID());
     this.setMeta("schema_version", String(SCHEMA_VERSION));
     this.storeId = this.getMeta("store_id")!;
@@ -293,6 +345,20 @@ export class TelegramArchive {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
       }
     }
+  }
+
+  /**
+   * Schema 3: media an earlier build archived as a placeholder joins the
+   * lifecycle, waiting for the retry sweep like media a bootstrap enrols.
+   */
+  private enrollArchivedMedia(): void {
+    this.db
+      .prepare(
+        `UPDATE messages SET media_state = 'pending', media_next_attempt = 0
+         WHERE media_state IS NULL AND deleted = 0 AND ${MEDIA_KIND_SQL} IN (${PROCESSABLE_KINDS_SQL})
+           AND json_extract(media_json, '$.fileId') IS NOT NULL`,
+      )
+      .run();
   }
 
   getMeta(key: string): string | undefined {
@@ -735,8 +801,8 @@ export class TelegramArchive {
    */
   private writeMessage(m: StoredMessage): boolean {
     const exists = this.db
-      .prepare("SELECT 1 FROM messages WHERE chat_id = ? AND msg_id = ?")
-      .get(m.chatId, m.msgId);
+      .prepare("SELECT media_json FROM messages WHERE chat_id = ? AND msg_id = ?")
+      .get(m.chatId, m.msgId) as { media_json: string | null } | undefined;
     let deletedAt: number | null = null;
     if (!exists) {
       const pending = this.db
@@ -753,8 +819,8 @@ export class TelegramArchive {
       .prepare(
         `INSERT INTO messages (chat_id, msg_id, box, ts, edit_ts, sender_id, sender_name, outgoing,
            text, reply_to_id, topic_id, forward_from, grouped_id, service, media_json,
-           deleted, deleted_at, extract_rev)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           deleted, deleted_at, extract_rev, media_state, media_next_attempt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(chat_id, msg_id) DO UPDATE SET
            edit_ts = excluded.edit_ts, sender_id = excluded.sender_id,
            sender_name = excluded.sender_name, text = excluded.text,
@@ -787,8 +853,15 @@ export class TelegramArchive {
         deletedAt === null ? 0 : 1,
         deletedAt,
         EXTRACT_REVISION,
+        enrols(m.media) ? "pending" : null,
+        enrols(m.media) ? 0 : null,
       );
     if (info.changes === 0 || deletedAt !== null) return false;
+    // An edit that replaced the media starts its lifecycle again; a fresh
+    // file reference for the same file does not.
+    if (exists && mediaIdentity(exists.media_json) !== mediaIdentity(m.media)) {
+      this.restartMediaLifecycle(m.chatId, m.msgId, enrols(m.media));
+    }
     const deleted = this.db
       .prepare("SELECT deleted FROM messages WHERE chat_id = ? AND msg_id = ?")
       .get(m.chatId, m.msgId) as { deleted: number };
@@ -1051,6 +1124,214 @@ export class TelegramArchive {
     return retired;
   }
 
+  // ── Media lifecycle (`docs/telegram-source.md` §10) ──────────────────
+
+  private restartMediaLifecycle(chatId: number, msgId: number, enrol: boolean): void {
+    this.db
+      .prepare(
+        `UPDATE messages SET media_state = ?, media_next_attempt = ?, media_attempts = 0,
+           media_last_error = NULL, transcript = NULL, media_extract_json = NULL
+         WHERE chat_id = ? AND msg_id = ?`,
+      )
+      .run(enrol ? "pending" : null, enrol ? 0 : null, chatId, msgId);
+  }
+
+  /**
+   * Record one media attempt's outcome. Nothing is marked dirty: the outcome
+   * is recorded while its day renders, so the page being built already shows
+   * it, and a pending retry is re-armed by the sweep when its backoff ends.
+   */
+  recordMediaOutcome(chatId: number, msgId: number, outcome: MediaOutcome): void {
+    const now = this.now();
+    const prior = this.db
+      .prepare("SELECT media_attempts AS a FROM messages WHERE chat_id = ? AND msg_id = ?")
+      .get(chatId, msgId) as { a: number } | undefined;
+    if (!prior) return;
+    const settle = (state: MediaState, sets = "", ...values: unknown[]): void => {
+      this.db
+        .prepare(
+          `UPDATE messages SET media_state = ?, media_next_attempt = NULL, media_last_error = NULL
+             ${sets} WHERE chat_id = ? AND msg_id = ?`,
+        )
+        .run(state, ...values, chatId, msgId);
+    };
+    switch (outcome.kind) {
+      case "transcribed":
+        settle(outcome.text === "" ? "empty" : "done", ", transcript = ?", outcome.text);
+        return;
+      case "extracted":
+        if (outcome.complete) {
+          settle("done", ", media_extract_json = ?", outcome.extraction);
+        } else {
+          // Useful text now, scanned pages later: keep it and stay enrolled.
+          const attempts = prior.a + 1;
+          this.db
+            .prepare(
+              `UPDATE messages SET media_state = 'pending', media_extract_json = ?,
+                 media_attempts = ?, media_next_attempt = ?, media_last_error = 'ocr-incomplete'
+               WHERE chat_id = ? AND msg_id = ?`,
+            )
+            .run(outcome.extraction, attempts, now + backoffStep(attempts), chatId, msgId);
+        }
+        return;
+      case "empty":
+        // An extraction kept from an earlier pass no longer says anything true.
+        settle("empty", ", media_extract_json = NULL");
+        return;
+      case "skipped":
+        settle("skipped", ", media_last_error = ?", outcome.reason);
+        return;
+      case "terminal":
+        settle("unavailable", ", media_last_error = ?", outcome.error);
+        return;
+      case "transient":
+      case "process-failed": {
+        const attempts = prior.a + 1;
+        const step =
+          outcome.kind === "transient" ? downloadRetryDelaySec(attempts) : backoffStep(attempts);
+        if (step === null) {
+          log.warn(`Telegram media ${chatId}/${msgId} unavailable after ${attempts} attempts`);
+          settle(
+            "unavailable",
+            ", media_attempts = ?, media_last_error = ?",
+            attempts,
+            outcome.error,
+          );
+          return;
+        }
+        const delay =
+          outcome.kind === "transient" ? Math.max(step, outcome.retryAfterSec ?? 0) : step;
+        this.db
+          .prepare(
+            `UPDATE messages SET media_state = 'pending', media_attempts = ?,
+               media_next_attempt = ?, media_last_error = ?
+             WHERE chat_id = ? AND msg_id = ?`,
+          )
+          .run(attempts, now + delay, outcome.error, chatId, msgId);
+        return;
+      }
+    }
+  }
+
+  /** Keep the fresh descriptor a download refreshed, without re-rendering anything. */
+  updateMediaDescriptor(chatId: number, msgId: number, media: MediaDescriptor): void {
+    this.db
+      .prepare("UPDATE messages SET media_json = ? WHERE chat_id = ? AND msg_id = ?")
+      .run(JSON.stringify(media), chatId, msgId);
+  }
+
+  /**
+   * The retry sweep: mark dirty the days of media whose backoff has ended, the
+   * most recent first and at most `limit` of them, so a backlog is worked
+   * through a few days per page instead of crowding out new messages.
+   */
+  markDueMediaDirty(scope: MediaScope, limit: number): number {
+    if (this.mediaFloodUntil() !== undefined) return 0;
+    const due = this.db
+      .prepare(
+        `SELECT chat_id, date(ts, 'unixepoch') AS date FROM messages
+         WHERE ${MEDIA_RETRY_ELIGIBILITY} AND media_next_attempt <= @now
+         GROUP BY chat_id, date ORDER BY MAX(ts) DESC LIMIT @limit`,
+      )
+      .all({ ...scopeParams(scope), now: this.now(), limit }) as {
+      chat_id: number;
+      date: string;
+    }[];
+    this.db.transaction(() => {
+      for (const { chat_id, date } of due) this.markDirty(chat_id, date);
+    })();
+    return due.length;
+  }
+
+  /** Whether media other than `excluding` (`chatId:msgId`) is due now. */
+  hasDueMedia(scope: MediaScope, excluding: ReadonlySet<string>): boolean {
+    if (this.mediaFloodUntil() !== undefined) return false;
+    const rows = this.db
+      .prepare(
+        `SELECT chat_id, msg_id FROM messages
+         WHERE ${MEDIA_RETRY_ELIGIBILITY} AND media_next_attempt <= @now LIMIT @limit`,
+      )
+      .all({ ...scopeParams(scope), now: this.now(), limit: excluding.size + 1 }) as {
+      chat_id: number;
+      msg_id: number;
+    }[];
+    return rows.some((r) => !excluding.has(`${r.chat_id}:${r.msg_id}`));
+  }
+
+  /** Unix seconds the earliest in-scope media comes due, if any does. */
+  nextMediaDue(scope: MediaScope): number | undefined {
+    const row = this.db
+      .prepare(`SELECT MIN(media_next_attempt) AS m FROM messages WHERE ${MEDIA_RETRY_ELIGIBILITY}`)
+      .get(scopeParams(scope)) as { m: number | null };
+    if (row.m === null) return undefined;
+    return Math.max(row.m, this.mediaFloodUntil() ?? 0);
+  }
+
+  /** Telegram asked to wait before the next download. */
+  recordMediaFlood(seconds: number): void {
+    this.setMeta("media_flood_until", String(this.now() + seconds));
+  }
+
+  /** Unix seconds downloads wait until, while a download flood wait lasts. */
+  mediaFloodUntil(): number | undefined {
+    const until = this.metaNumber("media_flood_until");
+    return until !== undefined && until > this.now() ? until : undefined;
+  }
+
+  /**
+   * Media still to process and media gone for good, inside `scope`. A pending
+   * voice note whose last attempt found no transcriber is also counted under
+   * `transcriberUnavailable`.
+   */
+  mediaHealthStats(scope: MediaScope): MediaHealthStats {
+    const rows = this.db
+      .prepare(
+        `SELECT media_state AS s, (${MEDIA_KIND_SQL} = 'voice') AS voice,
+                (media_last_error = @noTranscriber) AS noTranscriber, COUNT(*) AS n
+         FROM messages
+         WHERE media_state IN ('pending', 'unavailable') AND deleted = 0
+           AND (@minTs IS NULL OR ts >= @minTs)
+           AND ((@voiceNotes = 1 AND ${MEDIA_KIND_SQL} = 'voice')
+             OR (@attachments = 1 AND ${MEDIA_KIND_SQL} IN ('photo', 'document')))
+         GROUP BY s, voice, noTranscriber`,
+      )
+      .all({ ...scopeParams(scope), noTranscriber: TRANSCRIBER_UNAVAILABLE }) as {
+      s: "pending" | "unavailable";
+      voice: 0 | 1;
+      noTranscriber: 0 | 1 | null;
+      n: number;
+    }[];
+    const stats: MediaHealthStats = {
+      voiceNotes: { pending: 0, transcriberUnavailable: 0, unavailable: 0 },
+      attachments: { pending: 0, unavailable: 0 },
+    };
+    for (const row of rows) {
+      const bucket = row.voice ? stats.voiceNotes : stats.attachments;
+      bucket[row.s] += row.n;
+      if (row.voice && row.s === "pending" && row.noTranscriber) {
+        stats.voiceNotes.transcriberUnavailable += row.n;
+      }
+    }
+    return stats;
+  }
+
+  /**
+   * A resync processes every downloadable media again, due now: voice notes
+   * with the current transcriber, attachments with the current settings. The
+   * results already held stay until a new one replaces them.
+   */
+  resetMediaForResync(): void {
+    this.db
+      .prepare(
+        `UPDATE messages SET media_state = 'pending', media_attempts = 0, media_next_attempt = 0,
+           media_last_error = NULL
+         WHERE deleted = 0 AND ${MEDIA_KIND_SQL} IN (${PROCESSABLE_KINDS_SQL})
+           AND json_extract(media_json, '$.fileId') IS NOT NULL`,
+      )
+      .run();
+    this.deleteMeta("media_flood_until");
+  }
+
   /** Re-publish every day the archive holds (a resync). */
   markAllDirty(): void {
     this.db
@@ -1125,6 +1406,42 @@ function toStoredMessage(r: MessageRow): StoredMessage {
     ...(r.grouped_id !== null ? { groupedId: r.grouped_id } : {}),
     ...(r.service !== null ? { service: r.service } : {}),
     ...(r.media_json !== null ? { media: JSON.parse(r.media_json) as MediaDescriptor } : {}),
+    ...(r.media_state !== null ? { mediaState: r.media_state as MediaState } : {}),
+    ...(r.media_next_attempt !== null ? { mediaNextAttempt: r.media_next_attempt } : {}),
+    ...(r.media_last_error !== null ? { mediaLastError: r.media_last_error } : {}),
+    ...(r.transcript !== null ? { transcript: r.transcript } : {}),
+    ...(r.media_extract_json !== null
+      ? { extraction: JSON.parse(r.media_extract_json) as ExtractionResult }
+      : {}),
+  };
+}
+
+/** Whether media joins the lifecycle when its message is archived. */
+function enrols(media: MediaDescriptor | undefined): boolean {
+  return !!media?.fileId && isProcessableKind(media.kind);
+}
+
+/**
+ * What makes media the same file across re-reads: everything but the file id,
+ * whose embedded file reference changes when Telegram refreshes it.
+ */
+function mediaIdentity(media: MediaDescriptor | string | null | undefined): string {
+  if (!media) return "";
+  const parsed: MediaDescriptor =
+    typeof media === "string" ? (JSON.parse(media) as MediaDescriptor) : media;
+  const { fileId: _fileId, ...rest } = parsed;
+  return JSON.stringify(rest, Object.keys(rest).sort());
+}
+
+function scopeParams(scope: MediaScope): {
+  voiceNotes: number;
+  attachments: number;
+  minTs: number | null;
+} {
+  return {
+    voiceNotes: scope.voiceNotes ? 1 : 0,
+    attachments: scope.attachments ? 1 : 0,
+    minTs: scope.minTs ?? null,
   };
 }
 

@@ -12290,6 +12290,7 @@
         "evals/universes/telegram-sync/cast.json",
         "packages/providers/telegram/src/client/mtcute/adapter.test.ts",
         "packages/providers/telegram/src/document-event-profile.test.ts",
+        "packages/providers/telegram/src/media.test.ts",
         "packages/providers/telegram/src/normalizer.test.ts"
       ],
       "reason": "invented Telegram fixture name from the CLAUDE.md example set (people, venues and vendors), not corpus data."

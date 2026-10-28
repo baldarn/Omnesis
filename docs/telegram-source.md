@@ -1,6 +1,6 @@
 # Telegram source: implementation design
 
-Status: phases 1 (skeleton, auth, session, gate, registration) and 2 (text sync, edits, deletions, gaps, day documents, synthetic twin) implemented; phases 3–4 to follow, issue omnesis-dev/Omnesis#517. Each phase is built by a separate agent. Every path is relative to the repo root. "VERIFY" marked an mtcute API or behaviour that could not be confirmed from the published 0.32.7 types; phase 1 resolved every phase-1 item against the installed package and recorded the answer where the item was, marked **Resolved (phase 1)**. Section 15 collects them, with the deviations phases 1 and 2 made from this design (§15.10, §15.11).
+Status: phases 1 (skeleton, auth, session, gate, registration), 2 (text sync, edits, deletions, gaps, day documents, synthetic twin) and 3 (media) implemented; phase 4 to follow, issue omnesis-dev/Omnesis#517. Each phase is built by a separate agent. Every path is relative to the repo root. "VERIFY" marked an mtcute API or behaviour that could not be confirmed from the published 0.32.7 types; phase 1 resolved every phase-1 item against the installed package and recorded the answer where the item was, marked **Resolved (phase 1)**. Section 15 collects them, with the deviations phases 1, 2 and 3 made from this design (§15.10, §15.11, §15.12).
 
 ---
 
@@ -87,7 +87,9 @@ packages/providers/telegram/
   src/messages.ts         TelegramMessagesSource.sync(): walk budget → drain → media → page (section 7.6)
   src/normalizer.ts       normalizeDayChat() → DocumentInput (section 8)
   src/links.ts            telegramSourceUrl / telegramAppUrl (section 8.4)
-  src/media-retry.ts      media lifecycle and backoff (phase 3; mirrors whatsapp/src/media-retry.ts)
+  src/media-retry.ts      media lifecycle states, outcomes, backoff and download-failure classes (phase 3)
+  src/media.ts            the per-page media pass: voice-note transcription, attachment extraction (phase 3)
+  src/client/download.ts  downloadWithReferenceRefresh: the stale-file-reference rule both adapters share (phase 3)
   src/client/types.ts     TelegramAdapter, TelegramAuthAdapter, DTOs, TelegramError (section 4) — no mtcute types
   src/client/mtcute/adapter.ts  the only runtime mtcute import: MtcuteTelegramAdapter implements TelegramAdapter
   src/client/mtcute/storage.ts  EncryptedSqliteStorageDriver extends BaseSqliteStorageDriver; createMtcuteStorage()
@@ -249,10 +251,11 @@ export interface TelegramAdapter {
   ): Promise<{ messages: TgMessage[]; users: TgUser[] }>;
   getMessages(chatId: number, ids: number[]): Promise<(TgMessage | null)[]>; // channel or any chat
   getMessagesCommon(ids: number[]): Promise<(TgMessage | null)[]>; // common box, no peer
-  download(
-    media: TgMediaRef,
+  // Phase 3 (§15.12): addressed by message, so a stale file reference can be refreshed.
+  downloadMedia(
+    target: { chatId: number; msgId: number; fileId: string; size?: number },
     opts: { maxBytes: number; signal?: AbortSignal },
-  ): Promise<Uint8Array>;
+  ): Promise<{ data: Uint8Array; refreshed?: TgMediaRef }>;
   iterForumTopics(chatId: number): AsyncIterable<{ id: number; title: string }>; // phase 4
   takeout?(opts: TakeoutScope): Promise<TelegramAdapter>; // phase 4 (not yet in client/types.ts)
 }
@@ -290,7 +293,7 @@ export interface AdapterFactory {
 | `iterDialogs`                  | `iterDialogs({ archived: "keep" })`. The default is `"exclude"`, so passing `keep` is mandatory.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `getHistory`                   | `getHistory(chat, { offset, limit, minId })` / `iterHistory` (confirmed)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `getMessages`                  | `getMessages(chat, ids)` and `getMessagesUnsafe(ids)` (confirmed)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `download`                     | `downloadAsBuffer(location)` / `downloadAsIterable` (confirmed)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `downloadMedia`                | `downloadAsBuffer(fileId, { abortSignal, limit: maxBytes + 1, stallTimeout })`; on `FILE_REFERENCE_EXPIRED`, `getMessages(chat, [id])` and one retry with the fresh message's file id (`client/download.ts`, phase 3)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | auth                           | `signInQr({ onUrlUpdated, onQrScanned, password, invalidPasswordCallback, abortSignal })` (confirmed); `logOut()` (confirmed)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `iterForumTopics`              | `iterForumTopics(chat)` (confirmed)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `takeout`                      | `initTakeoutSession(params)` (confirmed)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -305,7 +308,7 @@ export interface AdapterFactory {
 - `failNext(method, TelegramError)`, `floodWait(method, seconds)`
 - `revoke(reason)`
 - `qr.rotate()`, `qr.scan(userId)`, `requirePassword(pw)`
-- `setMedia(fileId, bytes | "expired-ref" | "gone")`
+- `setMedia(fileId, bytes | "gone")`, `expireReference(chatId, msgId)` (phase 3: the old file id answers `FILE_REFERENCE_EXPIRED`, the message names a fresh one)
 - `calls` (an assertion log of every request, for budget and pacing tests)
 
 All ids, names and phones are invented: `+1 (555) 010-01xx`, `example.com`.
@@ -518,11 +521,11 @@ mtcute does **not** report `updates.differenceTooLong`: it sets `pts` and logs a
 1. If the provider is revoked, throw the auth `SyncError` (section 6). If the connection is down after a bounded reconnect, throw `SyncError("network")`, as WhatsApp's `connectionFailure()` does.
 2. Decode the cursor `{ phase, committedSeq, storeId }`. A foreign or legacy `storeId` means committedSeq 0 (WhatsApp `state.ts` semantics).
 3. Run the walk and reconcile budget (sections 7.2 and 7.4) unless `flood_until > now`.
-4. Media retry sweep, phase 3 (`markDueMediaDirty`, bounded).
-5. Call `archive.drain({ committedSeq, limit: DRAIN_DAY_LIMIT })`. For each day: apply the cutoff filter, transcribe voice notes, run `normalizeDayChat`, and extract attachments.
-6. **Tombstones.** These are dirty days with no surviving messages, plus every `emitted_attachments` row for a drained day whose external id is not in this render. Delete those ledger rows, and upsert the rows for emitted attachments, stamped with `emitSeq`.
+4. Media retry sweep (`markDueMediaDirty`, bounded by the page's media budget, most recent day first; skipped during a download flood wait).
+5. Call `archive.drain({ committedSeq, limit: DRAIN_DAY_LIMIT })`. For each day: apply the cutoff filter, transcribe voice notes, run `normalizeDayChat`, and extract attachments (`media.ts`).
+6. **Tombstones.** These are dirty days with no surviving messages, plus every `emitted_attachments` row for a drained day whose external id is not in this render. Ledger rows the render dropped are retired with `emitSeq` and leave the ledger when that page is acknowledged; the rows for emitted attachments are upserted, stamped with `emitSeq`. Every render emits the day's whole attachment set (§15.12), so the dropped rows are exactly the attachments that are gone.
 7. **`hasMore` and phase.**
-   - `hasMore = morePending || walkPending || reconcilePending || mediaContinues`.
+   - `hasMore = morePending || walkPending || reconcilePending || mediaContinues`. `mediaContinues` (phase 3): the page spent its media budget, other media is due, and the run has more than `MEDIA_CONTINUATION_MARGIN_MS` left.
    - `walkPending` is true while any chat is `pending`/`walking` and no flood wait is active.
    - `phase` is `"bootstrap"` while any walk is pending, otherwise `"incremental"`.
 8. **Progress.** `progress: { phase, processed, coverage, coverageSubject: "history" }`. Coverage is `complete` when every included chat is `done`, `partial` while a flood wait or permanent errors leave chats unwalked, and `unknown` while the walk is running.
@@ -534,23 +537,26 @@ mtcute does **not** report `updates.differenceTooLong`: it sets `pts` and logs a
 
 ### 7.8 `limits.ts` (tunables; the operator-facing ones are also advanced config fields)
 
-| Constant                     | Value            |
-| ---------------------------- | ---------------- |
-| `HISTORY_PAGE_SIZE`          | 100              |
-| `WALK_REQUESTS_PER_PAGE`     | 20               |
-| `HISTORY_MIN_INTERVAL_MS`    | 1000             |
-| `WALK_DEADLINE_MARGIN_MS`    | 120000           |
-| `DRAIN_DAY_LIMIT`            | 200              |
-| `FULL_RECONCILE_INTERVAL_H`  | 24               |
-| `RECONCILE_WINDOW_DAYS`      | 14               |
-| `GAP_SUSPECT_OUTAGE_S`       | 900              |
-| `PENDING_DELETION_TTL_DAYS`  | 30               |
-| `FLOOD_ISSUE_THRESHOLD_S`    | 600              |
-| `MAX_PASSWORD_ATTEMPTS`      | 3                |
-| `MEDIA_ATTEMPTS_PER_PAGE`    | 1                |
-| `MEDIA_DOWNLOAD_CONCURRENCY` | 1                |
-| `MEDIA_RETRY_BACKOFF_SEC`    | same as WhatsApp |
-| `MEDIA_MAX_ATTEMPTS`         | 12               |
+| Constant                       | Value                                               |
+| ------------------------------ | --------------------------------------------------- |
+| `HISTORY_PAGE_SIZE`            | 100                                                 |
+| `WALK_REQUESTS_PER_PAGE`       | 20                                                  |
+| `HISTORY_MIN_INTERVAL_MS`      | 1000                                                |
+| `WALK_DEADLINE_MARGIN_MS`      | 120000                                              |
+| `DRAIN_DAY_LIMIT`              | 200                                                 |
+| `FULL_RECONCILE_INTERVAL_H`    | 24                                                  |
+| `RECONCILE_WINDOW_DAYS`        | 14                                                  |
+| `GAP_SUSPECT_OUTAGE_S`         | 900                                                 |
+| `PENDING_DELETION_TTL_DAYS`    | 30                                                  |
+| `FLOOD_ISSUE_THRESHOLD_S`      | 600                                                 |
+| `MAX_PASSWORD_ATTEMPTS`        | 3                                                   |
+| `MEDIA_ATTEMPTS_PER_PAGE`      | 1                                                   |
+| `MEDIA_DOWNLOAD_CONCURRENCY`   | 1 (attempts run one at a time; no constant, §15.12) |
+| `MEDIA_RETRY_BACKOFF_SEC`      | same as WhatsApp                                    |
+| `MEDIA_MAX_ATTEMPTS`           | 12                                                  |
+| `VOICE_NOTE_MAX_BYTES`         | 25 MiB (phase 3)                                    |
+| `MEDIA_DOWNLOAD_STALL_MS`      | 60000 (phase 3)                                     |
+| `MEDIA_CONTINUATION_MARGIN_MS` | 15 min (phase 3, as WhatsApp)                       |
 
 ---
 
@@ -689,11 +695,11 @@ export default defineProvider<TelegramProvider>({
 - **Voice notes (`voice`):** download and `host.transcribeAudio`, with the transcript inline (section 8.2). They follow WhatsApp's `transcribeVoiceNotes` lifecycle, including `TRANSCRIBER_UNAVAILABLE` and `transcriptionSyncIssues`.
 - **`photo` and `document`:** go through `resolveAttachmentConfig(sourceConfig, { defaultEnabled: true })`, `shouldExtractAttachment(mime, size)` **before** download, then `download({ maxBytes })`, `host.extractAttachment`, and `buildAttachmentDocument`. Markers and `extra.attachments` follow WhatsApp's `extractMediaAttachments`.
 - **`audio`, `video`, `video_note`, `sticker`, `animation`** stay placeholders and are never downloaded.
-- **Lifecycle:** `media_state` takes the values `pending`, `done`, `empty`, `unavailable` and `transcriber-unavailable`, with the same backoff (`media-retry.ts` mirrors WhatsApp's).
+- **Lifecycle:** `media_state` takes the values `pending`, `done`, `empty`, `unavailable` and `skipped`, with the same backoff (`media-retry.ts` mirrors WhatsApp's). A missing transcriber is `pending` with `media_last_error = transcriber-unavailable`, as in WhatsApp (§15.12).
   - `FILE_REFERENCE_EXPIRED` → re-fetch the message (`getMessages`), update `media_json`, retry once in the same attempt.
   - `FLOOD_WAIT` → transient, `next_attempt = now + seconds`.
   - Not found or `forbidden` → terminal `unavailable`.
-  - Cancellation (`signal`) → leave pending.
+  - Cancellation (`signal`) or a revoked session → leave pending, record nothing, start no further download this page.
   - At most `MEDIA_ATTEMPTS_PER_PAGE` per page and `MEDIA_DOWNLOAD_CONCURRENCY` in parallel. Text is never blocked by media.
 - **Lazy:** only messages in days being drained are candidates. A bootstrap enrols media as `pending` and the retry sweep processes it gradually. There is never a bulk download pass.
 
@@ -814,10 +820,11 @@ Deliverables: media extraction, `media-retry.ts`, voice transcription, attachmen
 
 Acceptance:
 
-- [ ] Every phase-3 test passes.
-- [ ] No download during bootstrap except budgeted retries.
-- [ ] Flood and cancellation are honoured.
-- [ ] Attachment tombstones appear when their message is deleted.
+- [x] Every phase-3 test passes (`media.test.ts`, `media-retry.test.ts`, the media-lifecycle block of `message-store.test.ts`, `client/download.test.ts`, the `downloadMedia` block of `client/mtcute/adapter.test.ts`, the attachment parity in `document-event-profile.test.ts`, and the voice-note and attachment cases of `telegram-sync.e2e.test.ts`).
+- [x] No download during bootstrap except budgeted retries (`calls` assertions: one download per page).
+- [x] Flood and cancellation are honoured.
+- [x] Attachment tombstones appear when their message is deleted (unit and E2E).
+- [ ] A manual run against a real account: a voice note, a photo, a PDF, and a download after the file reference expired (hours later).
 
 ### Phase 4: channels, forum topics, Takeout, docs polish
 
@@ -887,4 +894,18 @@ Acceptance:
     - **Drain order** is most recent day first (WhatsApp drains oldest first), matching the walk's recent-first order.
     - **Adapter fixes found by the new conversion tests** (`client/mtcute/adapter.test.ts`, mtcute objects built from raw TL): a message that fails to convert becomes a text-less stub so the walk's checkpoint still moves past it; a forward header naming nobody no longer throws; a forum topic's header is a topic id, not a reply; a reply into another chat is not a reply here; TL boolean flags absent from an object read as `false`.
     - **Synthetic twin.** `packages/providers-synth/telegram` has no fixture-replay mode: `discover()` reports the universe self account only when the universe ships `sources/telegram-messages/fake-corpus.json`, and `createContext` seeds an invented app credential and a session the simulated server accepts (`SimulatedTelegram.seedAccount`) before the real context opens. Like every double it drops the real `contract.state` (`synth-double-isolation.test.ts` pins this); the real source still decodes its own cursor inside `sync()`.
-    - **Left for phase 3:** media download, transcription, attachment documents and the `attachment` profile type; the ledger mechanics they rely on (`settleAttachments`, retirement, tombstones) are in place and tested. **Left for phase 4:** the topic prefix and `extra.topics` (rows already keep `topic_id`), Takeout, website docs.
+    - **Left for phase 3 (done, §15.12):** media download, transcription, attachment documents and the `attachment` profile type; the ledger mechanics they rely on (`settleAttachments`, retirement, tombstones) are in place and tested. **Left for phase 4:** the topic prefix and `extra.topics` (rows already keep `topic_id`), Takeout, website docs.
+12. **Phase 3 deviations and notes for later phases.**
+    - **Adapter surface.** `download(media, opts)` became `downloadMedia({ chatId, msgId, fileId, size? }, opts)` returning `{ data, refreshed? }`. Refreshing a stale reference needs the message, which a bare media descriptor does not name. The rule (download; on `file-reference-expired`, `getMessages` and one retry with the fresh file id; a vanished message or a message without a file is `not-found`; the size limit before and after the fetch) lives in `client/download.ts`, free of mtcute, and both the mtcute and the simulated adapters download through it. The mtcute adapter adds `stallTimeout` (`MEDIA_DOWNLOAD_STALL_MS`) so a file the server never serves fails as a network error instead of hanging. The refreshed descriptor is written back to `media_json` without dirtying the day. Adapter-level tests drive the real `MtcuteTelegramAdapter` with its client's `downloadAsBuffer` and `getMessages` stubbed and mtcute documents built from raw TL; no network call was exercised (manual run).
+    - **Schema 3.** One additive column, `messages.media_extract_json` (an attachment's `ExtractionResult`), and the index `messages_media_retry(media_state, media_next_attempt)`. Opening an archive an earlier schema created enrols its downloadable voice notes, photos and documents as `pending`, due now, for the sweep. New messages are enrolled at insert; an edit that replaces the media (anything but the file id differs) restarts the lifecycle and drops the old transcript and extraction, while the same file under a refreshed reference does not.
+    - **Every render emits the day's whole attachment set.** WhatsApp emits an attachment document only on the render that extracted it. With a ledger that tombstones whatever a render did not emit, that would delete every attachment on the next re-render of its day, so the archive keeps each extraction and every render rebuilds the attachment documents from it without a download. That is also what makes a page the gateway never accepted harmless: the next render re-emits the attachments. Identical content re-emits with the same `contentHash`. A kept extraction is re-emitted even when a later attempt (a resync) finds the file gone; an attachment the settings now exclude (type, size, extraction switched off) is not emitted, so the ledger tombstones it on the day's next render. `seq` is assigned per `(filename, size, mime)` in message order over the day's photos and documents, whatever their processing state, so an id changes only when an earlier identical file is deleted, and the next render re-emits the survivor under its new id from the kept extraction.
+    - **State `skipped`** replaces `transcriber-unavailable` in the state list: an attachment the settings exclude is never downloaded and is not counted as unavailable (WhatsApp marks it unavailable). A resync looks at it again; one the settings now admit is attempted when its day renders. A missing transcriber is WhatsApp's `pending` with `media_last_error = transcriber-unavailable`, retried at the capped backoff for ever, and surfaced through `transcriptionSyncIssues` as a warning with the fix.
+    - **Flood waits on downloads** halt every further download of the page and record `meta.media_flood_until`; the sweep, the due check and the attempt gate all wait for it, and the media wake timer fires when it ends. The failed attempt is transient with `next_attempt = now + max(backoff, seconds)`. The walk's own flood wait is separate.
+    - **Wake timer.** As WhatsApp's store does, the source arms one unref'd timer for the earliest pending media in scope and wakes a sync through the provider's change handlers when it comes due; media already due when a page ends re-checks every 60 s instead of every second. `create()`'s `dispose` clears it.
+    - **Photos** are attachments named `photo.jpg` (Telegram photos are JPEG and carry no name), MIME `image/jpeg`, size from the largest thumbnail mtcute reports.
+    - **Transcription context**: speaker and participants are `telegram-user:<id>` LIDs plus the phone when visible (`telegramPersonIdentifiers`, shared with the normalizer), the conversation thread is the marked chat id, and at most 32 participants are named.
+    - **Concurrency** is one by construction (attempts are awaited one after another); no `MEDIA_DOWNLOAD_CONCURRENCY` constant exists because nothing would read it.
+    - **Day-document size** is not bounded: WhatsApp does not bound its day documents either, and a very large group's busiest day is one large document. Revisit with WhatsApp if the indexer ever caps document size.
+    - **`probeLocalStores`** was already complete from phase 1 (the two results of §5.4, tested in `message-store.test.ts` and `index.test.ts`); media bytes are never written to disk, so there is no third store.
+    - **Synthetic twin and harness.** A fixture message's `media` may carry `content`, the file's bytes as UTF-8, which the simulated server serves (`size` defaults to its length). `SyntheticE2EHarness` gained `sourceMediaProcessing`, which hands every source the collector's production attachment extractor and gateway transcriber as `main.ts` does (off by default, so other suites are unchanged); with `transcriberBackend: "replay"` a voice note is transcribed without a model. Common-box ids in a fixture must be unique across all private chats, basic groups and Saved Messages, as they are on Telegram.
+    - **Left for phase 4:** nothing media-specific. Channel media follows the same path once channels are opted in; Takeout is configured with `files: false` and must keep downloads on this lazy path.

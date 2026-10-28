@@ -11,13 +11,25 @@
  * the drain's acknowledgement (`committedSeq` of the archive `storeId`), so
  * everything the gateway did not accept re-emits.
  *
+ * Media is processed only on the days the page drains, a budgeted few
+ * downloads per page (`media.ts`); the retry sweep re-arms the days of media
+ * whose backoff ended, and a timer wakes a sync when the next one comes due.
+ *
  * `hasMore` is true only while there is work this page could not finish and
- * the next one can: more dirty days, or a walk that ran out of request budget.
- * A walk stopped by its deadline, a flood wait or the network waits for the
+ * the next one can: more dirty days, a walk that ran out of request budget,
+ * or media due beyond this page's budget while the run has time for it. A
+ * walk stopped by its deadline, a flood wait or the network waits for the
  * next scheduled sync, so a run always terminates.
  */
 
-import { createLogger } from "@omnesis/core";
+import {
+  createLogger,
+  resolveAttachmentConfig,
+  transcriptionSyncIssues,
+  type AttachmentExtractFn,
+  type AttachmentExtractionConfig,
+  type AudioTranscribeFn,
+} from "@omnesis/core";
 import {
   HistoryWalker,
   isChatIncluded,
@@ -25,9 +37,16 @@ import {
   type WalkLimits,
   type WalkerClock,
 } from "./history-walker.js";
-import { DRAIN_DAY_LIMIT, FLOOD_ISSUE_THRESHOLD_S } from "./limits.js";
+import {
+  DRAIN_DAY_LIMIT,
+  FLOOD_ISSUE_THRESHOLD_S,
+  MEDIA_ATTEMPTS_PER_PAGE,
+  MEDIA_CONTINUATION_MARGIN_MS,
+} from "./limits.js";
+import { MediaPass, mediaScopeOf, newMediaBudget } from "./media.js";
 import { dayExternalId, normalizeDayChat } from "./normalizer.js";
 import { telegramStateSpec } from "./state.js";
+import type { MediaScope } from "./message-store.js";
 import type { HistoryCoverage, SyncOptions, SyncResult, Unsubscribe } from "@omnesis/source-sdk";
 import type { DocumentInput, ProviderId, SourceId, SyncIssue } from "@omnesis/types";
 import type { TelegramProvider } from "./provider.js";
@@ -46,12 +65,33 @@ export interface TelegramMessagesSourceOptions {
   drainLimit?: number;
   clock?: WalkerClock;
   walkLimits?: Partial<WalkLimits>;
+  /** Speech-to-text for voice notes; without it they stay placeholders. */
+  transcribeAudio?: AudioTranscribeFn;
+  /** Text and OCR for photos and documents; without it no attachment is emitted. */
+  extractAttachment?: AttachmentExtractFn;
+  attachmentConfig?: AttachmentExtractionConfig;
+  /** Media downloads per page; tests raise it. */
+  mediaAttemptsPerPage?: number;
 }
+
+/** Floor and ceiling of the media wake timer (a 32-bit `setTimeout` clamps past it). */
+const MEDIA_WAKE_MIN_MS = 1000;
+const MEDIA_WAKE_MAX_MS = 2_147_483_000;
+/**
+ * Media already due when a page ends is a backlog the next pages work through;
+ * re-check on this cadence instead of waking a sync every second for it.
+ */
+const MEDIA_WAKE_OVERDUE_MS = 60_000;
 
 export class TelegramMessagesSource {
   private readonly walker: HistoryWalker;
   private readonly cutoffTs: number | undefined;
   private readonly drainLimit: number;
+  private readonly media: MediaPass;
+  private readonly mediaScope: MediaScope;
+  private readonly mediaAttempts: number;
+  private mediaWake: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
 
   constructor(
     private readonly provider: TelegramProvider,
@@ -61,6 +101,19 @@ export class TelegramMessagesSource {
     this.cutoffTs = Number.isFinite(cutoff) ? Math.ceil(cutoff / 1000) : undefined;
     this.drainLimit = options.drainLimit ?? DRAIN_DAY_LIMIT;
     provider.setChatPolicy(options.policy, this.cutoffTs);
+    this.mediaAttempts = options.mediaAttemptsPerPage ?? MEDIA_ATTEMPTS_PER_PAGE;
+    const mediaDeps = {
+      archive: provider.getArchive(),
+      adapter: provider.getAdapter(),
+      sourceId: options.sourceId,
+      selfId: provider.selfId,
+      attachmentConfig:
+        options.attachmentConfig ?? resolveAttachmentConfig(undefined, { defaultEnabled: true }),
+      ...(options.transcribeAudio ? { transcribeAudio: options.transcribeAudio } : {}),
+      ...(options.extractAttachment ? { extractAttachment: options.extractAttachment } : {}),
+    };
+    this.media = new MediaPass(mediaDeps);
+    this.mediaScope = mediaScopeOf(mediaDeps, this.cutoffTs);
     this.walker = new HistoryWalker({
       adapter: provider.getAdapter(),
       archive: provider.getArchive(),
@@ -73,14 +126,47 @@ export class TelegramMessagesSource {
 
   /** Wake the host whenever a live update changed the archive. */
   onPushEvent(callback: () => void): Unsubscribe {
-    return this.provider.onArchiveChange(callback);
+    const off = this.provider.onArchiveChange(callback);
+    // Media that came due while nobody listened can wake a sync now.
+    this.scheduleMediaWake();
+    return off;
   }
 
-  /** Re-publish the whole archive and list the dialogs again. */
+  /** Re-publish the whole archive, process its media again, and list the dialogs again. */
   onResync(): void {
     const archive = this.provider.getArchive();
+    archive.resetMediaForResync();
     archive.markAllDirty();
     archive.requestFullReconcile();
+  }
+
+  /** Stop the media wake timer. */
+  dispose(): void {
+    this.disposed = true;
+    if (this.mediaWake) clearTimeout(this.mediaWake);
+    this.mediaWake = undefined;
+  }
+
+  /**
+   * Wake a sync when the earliest pending media's backoff ends, so a retry
+   * runs on its own clock rather than at the next scheduled sync.
+   */
+  private scheduleMediaWake(): void {
+    if (this.mediaWake) clearTimeout(this.mediaWake);
+    this.mediaWake = undefined;
+    if (this.disposed) return;
+    const due = this.provider.getArchive().nextMediaDue(this.mediaScope);
+    if (due === undefined) return;
+    const untilDue = due * 1000 - Date.now();
+    const delay =
+      untilDue <= 0
+        ? MEDIA_WAKE_OVERDUE_MS
+        : Math.min(Math.max(untilDue, MEDIA_WAKE_MIN_MS), MEDIA_WAKE_MAX_MS);
+    this.mediaWake = setTimeout(() => {
+      this.mediaWake = undefined;
+      this.provider.wake();
+    }, delay);
+    this.mediaWake.unref?.();
   }
 
   async sync(
@@ -104,6 +190,10 @@ export class TelegramMessagesSource {
       ...(opts?.signal ? { signal: opts.signal } : {}),
     });
 
+    // The retry sweep: re-arm the days of media whose backoff ended, only as
+    // many as this page can attempt.
+    archive.markDueMediaDirty(this.mediaScope, this.mediaAttempts);
+
     const { days, emitSeq, morePending } = archive.drain({
       committedSeq,
       limit: this.drainLimit,
@@ -111,45 +201,65 @@ export class TelegramMessagesSource {
     const self = this.provider.selfUser();
     const documents: DocumentInput[] = [];
     const deletedExternalIds: string[] = [];
+    const budget = newMediaBudget(this.mediaAttempts);
     let processed = 0;
     for (const day of days) {
       const id = dayExternalId(day.chatId, day.date);
       const chat = archive.getChat(day.chatId);
+      if (!chat || day.messages.length === 0) {
+        deletedExternalIds.push(
+          id,
+          ...archive.settleAttachments(day.chatId, day.date, [], emitSeq),
+        );
+        continue;
+      }
       const messages =
         this.cutoffTs === undefined
           ? day.messages
           : day.messages.filter((m) => m.ts >= this.cutoffTs!);
-      // No attachments are rendered yet, so every ledgered one is retired.
-      const retired = archive.settleAttachments(day.chatId, day.date, [], emitSeq);
-      deletedExternalIds.push(...retired);
-      if (!chat || day.messages.length === 0) {
-        deletedExternalIds.push(id);
-        continue;
-      }
       // Older than the cutoff: never published, so nothing to remove either.
       if (messages.length === 0) continue;
       const userIds = messages.flatMap((m) => (m.senderId !== undefined ? [m.senderId] : []));
       if (chat.kind === "private") userIds.push(chat.chatId);
+      const users = archive.getUsers(userIds);
       const inDay = new Map(messages.map((m) => [m.msgId, m]));
       const replyIds = messages.flatMap((m) =>
         m.replyToId !== undefined && !inDay.has(m.replyToId) ? [m.replyToId] : [],
       );
       const replies = new Map([...inDay, ...archive.getMessages(day.chatId, replyIds)]);
-      documents.push(
-        normalizeDayChat({
-          chat,
-          date: day.date,
-          messages,
-          users: archive.getUsers(userIds),
-          replies,
-          self: {
-            id: this.provider.selfId,
-            ...(self?.phoneE164 ? { phoneE164: self.phoneE164 } : {}),
-          },
-          providerId: this.options.providerId,
-          sourceId: this.options.sourceId,
-          ...(this.options.phoneRegion ? { phoneRegion: this.options.phoneRegion } : {}),
-        }),
+      const context = {
+        chat,
+        messages,
+        users,
+        budget,
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+      };
+      await this.media.transcribeVoiceNotes(context);
+      const doc = normalizeDayChat({
+        chat,
+        date: day.date,
+        messages,
+        users,
+        replies,
+        self: {
+          id: this.provider.selfId,
+          ...(self?.phoneE164 ? { phoneE164: self.phoneE164 } : {}),
+        },
+        providerId: this.options.providerId,
+        sourceId: this.options.sourceId,
+        ...(this.options.phoneRegion ? { phoneRegion: this.options.phoneRegion } : {}),
+      });
+      const attachments = await this.media.extractAttachments(doc, context);
+      documents.push(doc, ...attachments);
+      // Every attachment the day still holds is in this render; the ledger
+      // retires the rest (a deleted message's file) for tombstoning.
+      deletedExternalIds.push(
+        ...archive.settleAttachments(
+          day.chatId,
+          day.date,
+          attachments.map((a) => a.externalId),
+          emitSeq,
+        ),
       );
       processed += messages.length;
     }
@@ -166,21 +276,50 @@ export class TelegramMessagesSource {
         : floodUntil !== undefined || summary.failed > 0
           ? "partial"
           : "unknown";
-    const hasMore = morePending || walk.stop === "budget";
+    const deadline = opts?.run?.deadline;
+    // A media backlog keeps the run going while this page spent its budget,
+    // other media is due, and the run has time for it; otherwise the wake
+    // timer or the next scheduled sync picks it up.
+    const mediaContinues =
+      budget.remaining === 0 &&
+      !budget.halted &&
+      (deadline === undefined || deadline - Date.now() > MEDIA_CONTINUATION_MARGIN_MS) &&
+      archive.hasDueMedia(this.mediaScope, budget.attempted);
+    const hasMore = morePending || walk.stop === "budget" || mediaContinues;
 
-    let issues: SyncIssue[] | undefined;
+    const issues: SyncIssue[] = [];
     const floodSeconds = archive.floodSeconds();
     if (floodUntil !== undefined && floodSeconds > FLOOD_ISSUE_THRESHOLD_S) {
-      issues = [
-        {
-          scope: "partition",
-          kind: "rate-limit",
-          severity: "info",
-          count: Math.max(1, unwalked + (summary.reconcilePending ? 1 : 0)),
-          message: `Telegram asked Omnesis to slow down; history resumes at ${new Date(floodUntil * 1000).toISOString()}.`,
-        },
-      ];
+      issues.push({
+        scope: "partition",
+        kind: "rate-limit",
+        severity: "info",
+        count: Math.max(1, unwalked + (summary.reconcilePending ? 1 : 0)),
+        message: `Telegram asked Omnesis to slow down; history resumes at ${new Date(floodUntil * 1000).toISOString()}.`,
+      });
     }
+    // The media backlog, stated once, on the page that ends the run (the host
+    // sums issues across a run's pages).
+    if (!hasMore && (this.mediaScope.voiceNotes || this.mediaScope.attachments)) {
+      const media = archive.mediaHealthStats(this.mediaScope);
+      const pending = media.voiceNotes.pending + media.attachments.pending;
+      const unavailable = media.voiceNotes.unavailable + media.attachments.unavailable;
+      if (pending > 0 || unavailable > 0) {
+        log.info(
+          `Telegram media: ${pending} awaiting download or retry, ${unavailable} unavailable`,
+        );
+      }
+      if (this.mediaScope.voiceNotes) {
+        issues.push(
+          ...transcriptionSyncIssues({
+            awaiting: media.voiceNotes.pending,
+            transcriberUnavailable: media.voiceNotes.transcriberUnavailable,
+            unavailable: media.voiceNotes.unavailable,
+          }),
+        );
+      }
+    }
+    this.scheduleMediaWake();
 
     log.info(
       `Telegram sync page: ${documents.length} docs, ${deletedExternalIds.length} removed, walk ${walk.stop} after ${walk.requests} requests (${phase}, coverage ${coverage}, hasMore ${hasMore})`,
@@ -189,7 +328,7 @@ export class TelegramMessagesSource {
     return {
       documents,
       deletedExternalIds,
-      ...(issues ? { issues } : {}),
+      ...(issues.length > 0 ? { issues } : {}),
       cursor: { phase, committedSeq: emitSeq, storeId: archive.storeId },
       hasMore,
       progress: { phase, processed, coverage, coverageSubject: "history" },

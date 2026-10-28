@@ -7,12 +7,16 @@
  * is invented.
  */
 
-import { describe, expect, it } from "vitest";
-import { Dialog, Message, PeersIndex, type tl } from "@mtcute/node";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { Dialog, Message, PeersIndex, tl } from "@mtcute/node";
 import {
   chatKind,
   convertMessage,
   markChannelId,
+  mtcuteAdapterFactory,
   sendersOf,
   toTgChat,
   toTgDialog,
@@ -323,5 +327,149 @@ describe("chats, dialogs and senders", () => {
     expect(users).toEqual([
       expect.objectContaining({ id: JAMIE_ID, phone: "12025550103", isSelf: false, isBot: false }),
     ]);
+  });
+});
+
+describe("MtcuteTelegramAdapter.downloadMedia", () => {
+  /** A raw document whose file reference is `ref`, as a fresh `getMessages` returns it. */
+  function documentMessage(ref: number): Message {
+    return message({
+      id: 7,
+      media: {
+        _: "messageMediaDocument",
+        document: {
+          _: "document",
+          id: { low: 77, high: 0, unsigned: false } as never,
+          accessHash: { low: 5, high: 0, unsigned: false } as never,
+          fileReference: new Uint8Array([ref, ref, ref]),
+          date: DATE,
+          mimeType: "text/plain",
+          size: 22,
+          dcId: 2,
+          attributes: [{ _: "documentAttributeFilename", fileName: "budget.txt" }],
+        },
+      } as never,
+    });
+  }
+
+  /** A real adapter whose client never touches the network: its calls are stubbed. */
+  function stubbedAdapter(stubs: {
+    downloadAsBuffer: (location: unknown, params: { limit?: number }) => Promise<Uint8Array>;
+    getMessages: () => Promise<(Message | null)[]>;
+  }) {
+    const dir = mkdtempSync(join(tmpdir(), "omnesis-telegram-adapter-"));
+    const adapter = mtcuteAdapterFactory.live(
+      { apiId: 1234567, apiHash: "0123456789abcdef0123456789abcdef" },
+      { dir, key: null },
+      { deviceModel: "Test", systemVersion: "1", appVersion: "1", langCode: "en" },
+    );
+    const client = (adapter as unknown as { client: Record<string, unknown> }).client;
+    client.downloadAsBuffer = vi.fn(stubs.downloadAsBuffer);
+    client.getMessages = vi.fn(stubs.getMessages);
+    return {
+      adapter,
+      client: client as unknown as {
+        downloadAsBuffer: ReturnType<typeof vi.fn>;
+        getMessages: ReturnType<typeof vi.fn>;
+      },
+      dir,
+    };
+  }
+
+  const BYTES = new TextEncoder().encode("Q4 budget review notes");
+
+  it("refreshes a stale file reference from the message and returns the fresh descriptor", async () => {
+    const stale = toTgMessage(documentMessage(1)).media!;
+    const fresh = toTgMessage(documentMessage(2)).media!;
+    expect(fresh.fileId).not.toBe(stale.fileId);
+    const { adapter, client, dir } = stubbedAdapter({
+      downloadAsBuffer: (location) =>
+        location === stale.fileId
+          ? Promise.reject(new tl.RpcError(400, "FILE_REFERENCE_EXPIRED"))
+          : Promise.resolve(BYTES),
+      getMessages: () => Promise.resolve([documentMessage(2)]),
+    });
+    try {
+      const result = await adapter.downloadMedia(
+        { chatId: JAMIE_ID, msgId: 7, fileId: stale.fileId!, size: 22 },
+        { maxBytes: 1000 },
+      );
+      expect(result.data).toBe(BYTES);
+      expect(result.refreshed).toMatchObject({
+        kind: "document",
+        fileId: fresh.fileId,
+        fileName: "budget.txt",
+      });
+      expect(client.getMessages).toHaveBeenCalledWith(JAMIE_ID, [7]);
+      // One byte past the limit is enough to tell an oversized file.
+      expect(client.downloadAsBuffer.mock.calls[0]![1]).toMatchObject({ limit: 1001 });
+    } finally {
+      await adapter.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies a download flood wait and a vanished message", async () => {
+    const flood = Object.assign(new tl.RpcError(420, "FLOOD_WAIT_%d"), { seconds: 45 });
+    const { adapter, dir } = stubbedAdapter({
+      downloadAsBuffer: () => Promise.reject(flood),
+      getMessages: () => Promise.resolve([null]),
+    });
+    try {
+      await expect(
+        adapter.downloadMedia({ chatId: JAMIE_ID, msgId: 7, fileId: "x" }, { maxBytes: 10 }),
+      ).rejects.toMatchObject({ code: "flood-wait", detail: { seconds: 45 } });
+    } finally {
+      await adapter.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const gone = stubbedAdapter({
+      downloadAsBuffer: () => Promise.reject(new tl.RpcError(400, "FILE_REFERENCE_EXPIRED")),
+      getMessages: () => Promise.resolve([null]),
+    });
+    try {
+      await expect(
+        gone.adapter.downloadMedia({ chatId: JAMIE_ID, msgId: 7, fileId: "x" }, { maxBytes: 10 }),
+      ).rejects.toMatchObject({ code: "not-found" });
+    } finally {
+      await gone.adapter.close();
+      rmSync(gone.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("describes photos, voice notes and documents for download", () => {
+    const voice = toTgMessage(
+      message({
+        media: {
+          _: "messageMediaDocument",
+          voice: true,
+          document: {
+            _: "document",
+            id: { low: 78, high: 0, unsigned: false } as never,
+            accessHash: { low: 5, high: 0, unsigned: false } as never,
+            fileReference: new Uint8Array([1]),
+            date: DATE,
+            mimeType: "audio/ogg",
+            size: 4096,
+            dcId: 2,
+            attributes: [{ _: "documentAttributeAudio", voice: true, duration: 7 }],
+          },
+        } as never,
+      }),
+    ).media;
+    expect(voice).toMatchObject({
+      kind: "voice",
+      mimeType: "audio/ogg",
+      size: 4096,
+      durationSec: 7,
+      isViewOnce: false,
+    });
+    expect(voice?.fileId).toEqual(expect.any(String));
+    expect(toTgMessage(documentMessage(1)).media).toMatchObject({
+      kind: "document",
+      mimeType: "text/plain",
+      fileName: "budget.txt",
+      size: 22,
+    });
   });
 });

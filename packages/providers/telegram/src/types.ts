@@ -2,7 +2,9 @@
 // Copyright (c) 2026 Adrien Conrath
 
 import type { SyncCursor } from "@omnesis/source-sdk";
+import type { ExtractionResult, TranscriptionPlaceholderState } from "@omnesis/core";
 import type { ChatKind, MessageBox, TgMediaRef } from "./client/types.js";
+import type { MediaState } from "./media-retry.js";
 
 /**
  * The cursor the host persists for `telegram-messages`: a position in the
@@ -16,7 +18,7 @@ export interface TelegramSyncCursor extends SyncCursor {
   storeId?: string;
 }
 
-/** What a message's media is, without its bytes: rendering and, later, download. */
+/** What a message's media is, without its bytes: for rendering and download. */
 export type MediaDescriptor = Omit<TgMediaRef, "isViewOnce">;
 
 /** A message as the archive keeps it (`messages` row). */
@@ -39,6 +41,21 @@ export interface StoredMessage {
   /** A service message's action, e.g. `message_pinned`. */
   service?: string;
   media?: MediaDescriptor;
+  /** Where the media lifecycle stands; absent for media Omnesis never downloads. */
+  mediaState?: MediaState;
+  /** Unix seconds before which the next media attempt waits. */
+  mediaNextAttempt?: number;
+  /** What the last failed media attempt reported, while it is still pending. */
+  mediaLastError?: string;
+  /** A voice note's transcript; `""` when it held no speech. */
+  transcript?: string;
+  /** An attachment's extraction, re-emitted on every render of its day. */
+  extraction?: ExtractionResult;
+  /**
+   * Render only, never stored: why a voice note shows no transcript, as the
+   * media pass worked it out for this render. Absent: no transcriber is wired.
+   */
+  transcription?: TranscriptionPlaceholderState;
 }
 
 /**

@@ -384,6 +384,11 @@ export class TelegramProvider {
     }
   }
 
+  /** Wake the host for work that is not an archive change (media coming due). */
+  wake(): void {
+    if (!this.disposed) this.notifyChange();
+  }
+
   private notifyChange(): void {
     for (const handler of this.changeHandlers) {
       try {

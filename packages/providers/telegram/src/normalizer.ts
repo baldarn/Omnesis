@@ -19,6 +19,7 @@ import {
   computeContentHash,
   extractEmailsFromText,
   extractPhonesFromText,
+  transcriptionPlaceholderNote,
 } from "@omnesis/core";
 import { servicePhrase } from "./message-extractor.js";
 import { telegramLinks } from "./links.js";
@@ -55,6 +56,21 @@ export interface DayRenderInput {
 type PhoneRegion = Parameters<typeof extractPhonesFromText>[1];
 
 const GROUPISH = new Set(["group", "supergroup", "forum"]);
+
+/**
+ * How a Telegram user is identified to the people graph: their account LID,
+ * and their phone when Telegram shows it.
+ */
+export function telegramPersonIdentifiers(
+  userId: number,
+  users: ReadonlyMap<number, StoredUser>,
+): PersonIdentifier[] {
+  const phone = users.get(userId)?.phoneE164;
+  return [
+    { kind: "lid", value: `${TELEGRAM_LID_PREFIX}:${userId}` },
+    ...(phone ? [{ kind: "phone" as const, value: phone }] : []),
+  ];
+}
 
 /** The day document's external id: the marked chat id and the UTC date. */
 export function dayExternalId(chatId: number, date: string): string {
@@ -141,13 +157,8 @@ export function normalizeDayChat(input: DayRenderInput): DocumentInput {
     // A channel or anonymous admin posts as the chat: not a person.
     if (userId <= 0) return;
     const name = cleanPersonName(user?.displayName ?? fallbackName);
-    const identifiers: PersonIdentifier[] = [
-      { kind: "lid", value: `${TELEGRAM_LID_PREFIX}:${userId}` },
-    ];
-    if (user?.phoneE164) {
-      identifiers.push({ kind: "phone", value: user.phoneE164 });
-      phones.add(user.phoneE164);
-    }
+    const identifiers = telegramPersonIdentifiers(userId, users);
+    if (user?.phoneE164) phones.add(user.phoneE164);
     people.push({ role: "participant", ...(name ? { name } : {}), identifiers });
     if (name) participants.add(name);
   };
@@ -208,6 +219,20 @@ export function normalizeDayChat(input: DayRenderInput): DocumentInput {
   };
 }
 
+/**
+ * A message's media placeholder. A transcribed voice note carries its text
+ * after the placeholder, so it is searchable; one without says why.
+ */
+function messagePlaceholder(m: StoredMessage): string | undefined {
+  const media = m.media!;
+  if (media.kind !== "voice") return mediaPlaceholder(media);
+  const transcript = m.transcript?.trim();
+  const base = mediaPlaceholder(media)!;
+  if (transcript) return `${base}: ${transcript}`;
+  if (!m.transcription) return base;
+  return `${base.slice(0, -1)} — ${transcriptionPlaceholderNote(m.transcription)}]`;
+}
+
 function renderMessage(
   m: StoredMessage,
   senderName: (m: Pick<StoredMessage, "outgoing" | "senderId" | "senderName">) => string,
@@ -226,7 +251,7 @@ function renderMessage(
 
   const parts: string[] = [];
   if (m.forwardFrom) parts.push(`(forwarded from ${m.forwardFrom})`);
-  const placeholder = m.media ? mediaPlaceholder(m.media) : undefined;
+  const placeholder = m.media ? messagePlaceholder(m) : undefined;
   if (placeholder) parts.push(placeholder);
   if (m.text) parts.push(m.text);
   const edited = m.editTs ? " (edited)" : "";

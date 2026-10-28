@@ -12,7 +12,7 @@
  */
 
 import { join } from "node:path";
-import { DEFAULT_CONFIG_DIR, normalizePhone } from "@omnesis/core";
+import { DEFAULT_CONFIG_DIR, normalizePhone, resolveAttachmentConfig } from "@omnesis/core";
 import {
   config,
   defineProvider,
@@ -181,7 +181,10 @@ export function buildTelegramProvider(
           }),
         }),
 
-        create({ host, accountId, sourceId, providerId, config: options, dataCutoff }, provider) {
+        create(
+          { host, accountId, sourceId, providerId, config: options, dataCutoff, sourceConfig },
+          provider,
+        ) {
           const configDir = host?.configDir;
           const stateDir =
             host?.stateDir ?? (configDir ? accountDir(configDir, accountId) : undefined);
@@ -196,6 +199,9 @@ export function buildTelegramProvider(
             },
             ...(dataCutoff ? { dataCutoff } : {}),
             ...(host?.ingestion?.phoneRegion ? { phoneRegion: host.ingestion.phoneRegion } : {}),
+            attachmentConfig: resolveAttachmentConfig(sourceConfig, { defaultEnabled: true }),
+            ...(host?.transcribeAudio ? { transcribeAudio: host.transcribeAudio } : {}),
+            ...(host?.extractAttachment ? { extractAttachment: host.extractAttachment } : {}),
             walkLimits: {
               requestsPerPage: positiveInt(options?.historyRequestsPerPage, WALK_REQUESTS_PER_PAGE),
               minIntervalMs: positiveInt(options?.historyMinIntervalMs, HISTORY_MIN_INTERVAL_MS),
@@ -214,6 +220,7 @@ export function buildTelegramProvider(
                 stateDir && configDir ? inspectTelegramStores(stateDir, configDir) : [],
               ),
             async dispose() {
+              source.dispose();
               await provider.dispose();
             },
           });

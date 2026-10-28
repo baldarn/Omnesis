@@ -28,8 +28,8 @@ import {
   writeAppCredentials,
 } from "./testing/fixtures.js";
 import { extractMessage } from "./message-extractor.js";
-import type { DrainedDay } from "./message-store.js";
-import type { TgChat } from "./client/types.js";
+import type { DrainedDay, MediaScope } from "./message-store.js";
+import type { TgChat, TgMediaRef } from "./client/types.js";
 import type { StoredMessage } from "./types.js";
 
 const HEADER = "SQLite format 3\0";
@@ -97,7 +97,7 @@ describe("TelegramArchive storage", () => {
     }
     const reopened = openArchive();
     expect(reopened.storeId).toBe(id);
-    expect(reopened.getMeta("schema_version")).toBe("2");
+    expect(reopened.getMeta("schema_version")).toBe("3");
     reopened.close();
   });
 
@@ -362,5 +362,159 @@ describe("TelegramArchive writes and drain", () => {
     archive = TelegramArchive.open(path, null, { now: () => clock });
     archive.upsertUsers([HELPER_BOT]);
     expect(archive.getUser(HELPER_BOT.id)).toMatchObject({ isBot: true, isDeleted: false });
+  });
+});
+
+describe("TelegramArchive media lifecycle", () => {
+  let dir: string;
+  let clock: number;
+  let archive: TelegramArchive;
+  const chat: TgChat = privateChatWith(JAMIE);
+  const ALL: MediaScope = { voiceNotes: true, attachments: true };
+
+  beforeEach(() => {
+    dir = tempConfigDir("archive-media");
+    clock = T0 + 86_400;
+    archive = TelegramArchive.open(dir, null, { now: () => clock });
+  });
+
+  afterEach(() => {
+    archive.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function withMedia(id: number, ts: number, media: TgMediaRef, editDate?: number): StoredMessage {
+    return extractMessage(
+      messageIn(chat, id, ts, "", { senderId: JAMIE.id, media, ...(editDate ? { editDate } : {}) }),
+    )!;
+  }
+
+  function live(m: StoredMessage): boolean {
+    return archive.storeLive(chat, [JAMIE], m, { id: m.msgId, date: m.ts }, true);
+  }
+
+  const read = (id: number): StoredMessage => archive.getMessages(chat.id, [id]).get(id)!;
+  const pdf = (fileId: string, size = 100): TgMediaRef => ({
+    kind: "document",
+    fileId,
+    fileName: "plan.pdf",
+    mimeType: "application/pdf",
+    size,
+    isViewOnce: false,
+  });
+
+  it("enrols downloadable voice notes, photos and documents, and nothing else", () => {
+    live(withMedia(1, T0, { kind: "voice", fileId: "v", isViewOnce: false }));
+    live(withMedia(2, T0, pdf("d")));
+    live(withMedia(3, T0, { kind: "video", fileId: "m", isViewOnce: false }));
+    live(withMedia(4, T0, { kind: "photo", isViewOnce: false }));
+    expect([1, 2, 3, 4].map((id) => read(id).mediaState)).toEqual([
+      "pending",
+      "pending",
+      undefined,
+      undefined,
+    ]);
+    expect(read(1).mediaNextAttempt).toBe(0);
+  });
+
+  it("re-arms only the due days in scope, most recent first, bounded by the limit", () => {
+    live(withMedia(1, T0, { kind: "voice", fileId: "v", isViewOnce: false }));
+    live(withMedia(2, T0 + 86_400, pdf("d")));
+    archive.drain({ committedSeq: 0, limit: 10 });
+    archive.drain({ committedSeq: 1, limit: 10 });
+    expect(archive.dirtyDayCount()).toBe(0);
+
+    expect(archive.markDueMediaDirty({ voiceNotes: true, attachments: false }, 10)).toBe(1);
+    const [voiceDay] = archive.drain({ committedSeq: 2, limit: 10 }).days;
+    expect(voiceDay?.date).toBe("2026-03-10");
+    archive.drain({ committedSeq: 3, limit: 10 });
+    expect(archive.markDueMediaDirty(ALL, 1)).toBe(1);
+    expect(archive.drain({ committedSeq: 4, limit: 10 }).days.map((d) => d.date)).toEqual([
+      "2026-03-11",
+    ]);
+    // Inside the cutoff only.
+    archive.drain({ committedSeq: 5, limit: 10 });
+    expect(archive.markDueMediaDirty({ ...ALL, minTs: T0 + 3 * 86_400 }, 10)).toBe(0);
+  });
+
+  it("backs a failed download off, gives it up after the last attempt, and never gives up processing", () => {
+    live(withMedia(1, T0, pdf("d1")));
+    live(withMedia(2, T0, pdf("d2", 200)));
+    archive.recordMediaOutcome(chat.id, 1, { kind: "transient", error: "Connection reset" });
+    expect(read(1)).toMatchObject({ mediaState: "pending", mediaNextAttempt: clock + 20 });
+    expect(archive.nextMediaDue(ALL)).toBe(0);
+    archive.recordMediaOutcome(chat.id, 2, { kind: "transient", error: "x", retryAfterSec: 900 });
+    expect(read(2).mediaNextAttempt).toBe(clock + 900);
+    for (let i = 0; i < 11; i++) {
+      archive.recordMediaOutcome(chat.id, 1, { kind: "transient", error: "Connection reset" });
+    }
+    expect(read(1).mediaState).toBe("unavailable");
+    for (let i = 0; i < 20; i++) {
+      archive.recordMediaOutcome(chat.id, 2, {
+        kind: "process-failed",
+        error: "extraction-failed",
+      });
+    }
+    expect(read(2)).toMatchObject({ mediaState: "pending", mediaNextAttempt: clock + 43_200 });
+    expect(archive.mediaHealthStats(ALL)).toEqual({
+      voiceNotes: { pending: 0, transcriberUnavailable: 0, unavailable: 0 },
+      attachments: { pending: 1, unavailable: 1 },
+    });
+  });
+
+  it("keeps a transcript and an extraction, and a resync processes them again without losing them", () => {
+    live(withMedia(1, T0, { kind: "voice", fileId: "v", isViewOnce: false }));
+    live(withMedia(2, T0, pdf("d")));
+    archive.recordMediaOutcome(chat.id, 1, { kind: "transcribed", text: "Rehearsal at six" });
+    archive.recordMediaOutcome(chat.id, 2, {
+      kind: "extracted",
+      extraction: JSON.stringify({ text: "Floor plan", truncated: false }),
+      complete: true,
+    });
+    expect(read(1)).toMatchObject({ mediaState: "done", transcript: "Rehearsal at six" });
+    expect(read(2)).toMatchObject({ mediaState: "done", extraction: { text: "Floor plan" } });
+    archive.resetMediaForResync();
+    expect(read(1)).toMatchObject({ mediaState: "pending", transcript: "Rehearsal at six" });
+    expect(read(2)).toMatchObject({ mediaState: "pending", extraction: { text: "Floor plan" } });
+  });
+
+  it("restarts the lifecycle when an edit replaces the media, not when only the reference changes", () => {
+    live(withMedia(1, T0, pdf("d1")));
+    archive.recordMediaOutcome(chat.id, 1, {
+      kind: "extracted",
+      extraction: JSON.stringify({ text: "Old plan", truncated: false }),
+      complete: true,
+    });
+    // The same file under a refreshed reference, delivered by an edit of the caption.
+    live(withMedia(1, T0, pdf("d1~ref2"), T0 + 60));
+    expect(read(1)).toMatchObject({ mediaState: "done", extraction: { text: "Old plan" } });
+    // A different file.
+    live(withMedia(1, T0, pdf("d9", 999), T0 + 120));
+    expect(read(1)).toMatchObject({ mediaState: "pending", mediaNextAttempt: 0 });
+    expect(read(1).extraction).toBeUndefined();
+  });
+
+  it("holds every download while a download flood wait lasts", () => {
+    live(withMedia(1, T0, pdf("d1")));
+    archive.recordMediaFlood(300);
+    expect(archive.mediaFloodUntil()).toBe(clock + 300);
+    expect(archive.markDueMediaDirty(ALL, 10)).toBe(0);
+    expect(archive.hasDueMedia(ALL, new Set())).toBe(false);
+    expect(archive.nextMediaDue(ALL)).toBe(clock + 300);
+    clock += 301;
+    expect(archive.hasDueMedia(ALL, new Set())).toBe(true);
+    expect(archive.hasDueMedia(ALL, new Set([`${chat.id}:1`]))).toBe(false);
+  });
+
+  it("enrols the media a schema-2 archive kept as placeholders", () => {
+    live(withMedia(1, T0, pdf("d1")));
+    archive.close();
+    const raw = new Database(join(dir, "archive.db"));
+    raw.exec("UPDATE messages SET media_state = NULL, media_next_attempt = NULL");
+    raw.exec("UPDATE meta SET value = '2' WHERE key = 'schema_version'");
+    raw.close();
+    archive = TelegramArchive.open(dir, null, { now: () => clock });
+    expect(read(1)).toMatchObject({ mediaState: "pending", mediaNextAttempt: 0 });
+    expect(archive.getMeta("schema_version")).toBe("3");
   });
 });

@@ -38,7 +38,8 @@ import {
 } from "@mtcute/node";
 import { LogManager } from "@mtcute/core/utils.js";
 import { createLogger, toErrorMessage } from "@omnesis/core";
-import { FLOOD_SLEEP_MAX_MS } from "../../limits.js";
+import { FLOOD_SLEEP_MAX_MS, MEDIA_DOWNLOAD_STALL_MS } from "../../limits.js";
+import { downloadWithReferenceRefresh } from "../download.js";
 import { mapRpcError } from "../errors.js";
 import {
   TelegramError,
@@ -51,6 +52,8 @@ import {
   type TelegramAuthAdapter,
   type TgChat,
   type TgDialog,
+  type TgDownloaded,
+  type TgMediaDownload,
   type TgMediaRef,
   type TgMessage,
   type TgUpdate,
@@ -255,24 +258,24 @@ class MtcuteTelegramAdapter implements TelegramAdapter {
     );
   }
 
-  download(
-    media: TgMediaRef,
+  downloadMedia(
+    target: TgMediaDownload,
     opts: { maxBytes: number; signal?: AbortSignal },
-  ): Promise<Uint8Array> {
-    const fileId = media.fileId;
-    if (!fileId) return Promise.reject(new TelegramError("not-found", "This media has no file"));
-    if (media.size !== undefined && media.size > opts.maxBytes) {
-      return Promise.reject(new TelegramError("forbidden", "The file is larger than allowed"));
-    }
-    return this.guard(async () => {
-      const bytes = await this.client.downloadAsBuffer(fileId, {
-        abortSignal: opts.signal,
-        limit: opts.maxBytes + 1,
-      });
-      if (bytes.length > opts.maxBytes) {
-        throw new TelegramError("forbidden", "The file is larger than allowed");
-      }
-      return bytes;
+  ): Promise<TgDownloaded> {
+    return downloadWithReferenceRefresh(target, opts.maxBytes, {
+      download: (fileId) =>
+        this.guard(() =>
+          this.client.downloadAsBuffer(fileId, {
+            abortSignal: opts.signal,
+            // One byte over the limit is enough to know the file is too large.
+            limit: opts.maxBytes + 1,
+            stallTimeout: MEDIA_DOWNLOAD_STALL_MS,
+          }),
+        ),
+      refetch: async (chatId, msgId) => {
+        const [fresh] = await this.getMessages(chatId, [msgId]);
+        return fresh ?? null;
+      },
     });
   }
 
