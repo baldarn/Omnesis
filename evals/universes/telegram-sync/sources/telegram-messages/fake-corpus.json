@@ -44,10 +44,38 @@
           "media": { "kind": "document", "fileName": "entry-form.pdf", "isViewOnce": false }
         },
         {
+          "id": 106,
+          "at": "2026-03-10T09:20:00Z",
+          "from": 5550100202,
+          "text": "The tally sheet",
+          "media": {
+            "kind": "document",
+            "fileId": "tg-file-heron-tally",
+            "fileName": "heron-tally.txt",
+            "mimeType": "text/plain",
+            "isViewOnce": false,
+            "content": "Heron tally for the north marsh: forty-two adults, nine fledglings."
+          }
+        },
+        {
           "id": 107,
           "at": "2026-03-11T18:30:00Z",
           "from": 5550100202,
           "text": "Tickets for the Stellar Sound matinee are booked."
+        },
+        {
+          "id": 108,
+          "at": "2026-03-11T18:35:00Z",
+          "from": 5550100202,
+          "text": "",
+          "media": {
+            "kind": "voice",
+            "fileId": "tg-file-maya-voice",
+            "mimeType": "audio/ogg",
+            "durationSec": 9,
+            "isViewOnce": false,
+            "content": "Remember the spotting scope for the Saturday survey."
+          }
         }
       ]
     },

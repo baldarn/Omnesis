@@ -15,6 +15,11 @@
  *     day documents are searchable;
  *   - a live edit and a live deletion through the simulated server are
  *     reflected in the stored day document;
+ *   - a voice note is transcribed into its day (the gateway runs the replay
+ *     transcriber, which reads the audio bytes back as text: no model), and a
+ *     text document becomes a searchable attachment of its day;
+ *   - deleting the message that carried an attachment removes the attachment
+ *     and keeps the day;
  *   - a day whose every message is deleted disappears from the gateway;
  *   - the account's own messages resolve to the cast's self person through
  *     the descriptor's `selfIdentity` alias.
@@ -79,6 +84,13 @@ describe("Telegram wraps-real: day documents, live edits and deletions, self ide
       )
       .get(SOURCE_ID, externalId) as DocRow | undefined;
 
+  const attachmentOf = (dayId: string): DocRow | undefined =>
+    db
+      .prepare(
+        "SELECT id, external_id, content, metadata FROM documents WHERE source_id = ? AND external_id LIKE ?",
+      )
+      .get(SOURCE_ID, `${dayId}/att/%`) as DocRow | undefined;
+
   const selfAliasOwner = (): { is_self: number; name: string } | undefined =>
     db
       .prepare(
@@ -92,6 +104,8 @@ describe("Telegram wraps-real: day documents, live edits and deletions, self ide
     harness = new SyntheticE2EHarness({
       gatewayMode: "synthetic",
       universe: "telegram-sync",
+      transcriberBackend: "replay",
+      sourceMediaProcessing: true,
       extraGatewayConfig: {
         // The install-level operator: the self person the alias attaches to.
         // A self is only created with an identifier, not from a name alone.
@@ -123,6 +137,7 @@ describe("Telegram wraps-real: day documents, live edits and deletions, self ide
       }>
     )
       .map((r) => r.external_id)
+      .filter((id) => !id.includes("/att/"))
       .sort();
     expect(ids).toEqual([CLUB_DAY, CREW_DAY, MAYA_DAY_1, MAYA_DAY_2, SAVED_DAY].sort());
     expect(doc(CHANNEL_DAY)).toBeUndefined();
@@ -146,6 +161,41 @@ describe("Telegram wraps-real: day documents, live edits and deletions, self ide
     expect((res.results ?? []).some((r) => r.source_id === SOURCE_ID)).toBe(true);
   });
 
+  test("a voice note is transcribed inline and a document becomes an attachment", async () => {
+    // Media is downloaded a budgeted few per page; later syncs work through it.
+    const attachment = await waitFor(async () => {
+      const att = attachmentOf(MAYA_DAY_1);
+      if (doc(MAYA_DAY_2)?.content.includes("Remember the spotting scope") && att) return att;
+      await harness.triggerSyncAndWait(SOURCE_ID, 60_000);
+      return undefined;
+    }, "the transcribed voice note and the extracted attachment");
+    expect(doc(MAYA_DAY_2)!.content).toContain(
+      "Maya Reeves: [Voice note, 0:09]: Remember the spotting scope for the Saturday survey.",
+    );
+    expect(attachment.content).toContain("Heron tally for the north marsh");
+    expect(JSON.parse(attachment.metadata)).toMatchObject({
+      documentType: "attachment",
+      extra: { parentExternalId: MAYA_DAY_1, originalFilename: "heron-tally.txt" },
+    });
+    await harness.refreshSearchSnapshot();
+    const res = (await harness.gatewayJson(
+      `/documents/search?q=${encodeURIComponent("Heron tally for the north marsh")}&limit=50`,
+    )) as { results?: Array<{ external_id?: string; source_id: string }> };
+    expect((res.results ?? []).some((r) => r.source_id === SOURCE_ID)).toBe(true);
+  });
+
+  test("deleting the message that carried an attachment removes only the attachment", async () => {
+    const ctrl = await controller();
+    const attachmentId = attachmentOf(MAYA_DAY_1)!.external_id;
+    ctrl.server.pushDelete(MAYA_ID, [106]);
+    await harness.triggerSyncAndWait(SOURCE_ID, 60_000);
+    await waitFor(
+      () => (doc(attachmentId) ? undefined : true),
+      "the deleted message's attachment to be removed",
+    );
+    expect(doc(MAYA_DAY_1)!.content).not.toContain("The tally sheet");
+  });
+
   test("a live edit and a live deletion are reflected in the day document", async () => {
     const ctrl = await controller();
     ctrl.server.pushEdit(
@@ -166,7 +216,7 @@ describe("Telegram wraps-real: day documents, live edits and deletions, self ide
 
   test("a day whose messages are all deleted disappears", async () => {
     const ctrl = await controller();
-    ctrl.server.pushDelete(MAYA_ID, [107]);
+    ctrl.server.pushDelete(MAYA_ID, [107, 108]);
     await harness.triggerSyncAndWait(SOURCE_ID, 60_000);
     await waitFor(() => (doc(MAYA_DAY_2) ? undefined : true), "the emptied day to be removed");
     expect(doc(MAYA_DAY_1)).toBeDefined();

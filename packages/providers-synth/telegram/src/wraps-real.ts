@@ -13,7 +13,8 @@
  * `sources/telegram-messages/fake-corpus.json`, a compact form of the
  * simulation's corpus. A test reaches the live server through
  * {@link getTelegramWrapsRealController} to post, edit and delete messages,
- * which arrive as live updates exactly as Telegram's would.
+ * which arrive as live updates exactly as Telegram's would. Media whose
+ * fixture carries `content` is downloadable, so the real media pass runs too.
  */
 
 import { loadActiveUniverse, loadSourceFixtureJson } from "@omnesis/providers-synth-common";
@@ -48,7 +49,12 @@ interface FixtureMessage {
   from: number;
   text: string;
   replyTo?: number;
-  media?: TgMediaRef;
+  /**
+   * The message's media. `content` is the file's bytes as UTF-8 text, which
+   * the simulated server serves for download: a document's text, or what a
+   * voice note says to the replay transcriber. `size` defaults to its length.
+   */
+  media?: TgMediaRef & { content?: string };
 }
 
 interface FixtureChat {
@@ -145,10 +151,29 @@ function simulatedCorpus(fixture: TelegramFakeCorpusFixture): {
         outgoing: m.from === selfId,
         text: m.text,
         ...(m.replyTo ? { replyToId: m.replyTo } : {}),
-        ...(m.media ? { media: m.media } : {}),
+        ...(m.media ? { media: fixtureMedia(m.media) } : {}),
       })),
     })),
   };
+}
+
+/** A fixture's media as Telegram describes it: no bytes, the size they would have. */
+function fixtureMedia(media: NonNullable<FixtureMessage["media"]>): TgMediaRef {
+  const { content, ...ref } = media;
+  return content === undefined || ref.size !== undefined
+    ? ref
+    : { ...ref, size: Buffer.byteLength(content, "utf8") };
+}
+
+/** Serve every fixture file that has content. */
+function seedMedia(sim: SimulatedTelegram, fixture: TelegramFakeCorpusFixture): void {
+  for (const chat of fixture.chats) {
+    for (const m of chat.messages) {
+      if (m.media?.fileId && m.media.content !== undefined) {
+        sim.setMedia(m.media.fileId, new TextEncoder().encode(m.media.content));
+      }
+    }
+  }
 }
 
 /** The test's handle on a live wraps-real source. */
@@ -163,7 +188,11 @@ let server: SimulatedTelegram | null = null;
 
 /** The one simulated server of this process, built from the universe on first use. */
 export function simulatedServer(): SimulatedTelegram {
-  server ??= new SimulatedTelegram(simulatedCorpus(loadTelegramFixture()));
+  if (!server) {
+    const fixture = loadTelegramFixture();
+    server = new SimulatedTelegram(simulatedCorpus(fixture));
+    seedMedia(server, fixture);
+  }
   return server;
 }
 
