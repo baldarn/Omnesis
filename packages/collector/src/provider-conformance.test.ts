@@ -182,6 +182,7 @@ const current: Record<string, unknown> = {
     syncedUpTo: timestamp,
   },
   plaid: { phase: "transactions", transactionsCursor: "page-2", lastSnapshotDate: "2026-01-02" },
+  "telegram-messages": { phase: "incremental", committedSeq: 42, storeId: "store-1" },
   "whatsapp-messages": {
     phase: "incremental",
     lastTimestamp: 700,

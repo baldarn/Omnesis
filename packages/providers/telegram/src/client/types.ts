@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Adrien Conrath
+
+/**
+ * The boundary between this provider and the Telegram client library.
+ *
+ * Everything outside `client/mtcute/` talks to Telegram through these types and
+ * nothing else: no mtcute class, enum or TL object crosses this line. That is
+ * what lets the tests drive the whole provider against an in-memory simulation
+ * (`testing/simulated-telegram.ts`), and what would let another client library
+ * replace mtcute without touching the sync logic.
+ *
+ * Ids are mtcute "marked" ids: a user is positive, a basic group is `-id`, and
+ * a channel or supergroup is `-100…id`. A message id is unique within its
+ * {@link MessageBox}: private chats and basic groups share one account-wide id
+ * space (`common`), and each channel or supergroup has its own.
+ */
+
+export type ChatKind = "private" | "saved" | "group" | "supergroup" | "forum" | "channel";
+
+/**
+ * Where a message id is unique. `common` covers private chats and basic groups,
+ * whose ids are account-wide; a channel or supergroup is `channel:<marked id>`.
+ */
+export type MessageBox = "common" | `channel:${number}`;
+
+export interface TgUser {
+  id: number;
+  firstName?: string;
+  lastName?: string;
+  username?: string;
+  /** Digits only, as Telegram reports them; absent when the user hides it. */
+  phone?: string;
+  isBot: boolean;
+  isDeleted: boolean;
+  isSelf: boolean;
+}
+
+export interface TgChat {
+  id: number;
+  kind: ChatKind;
+  title: string;
+  username?: string;
+  isArchived: boolean;
+  topMessageId: number;
+  isForum: boolean;
+  participantsCount?: number;
+}
+
+export interface TgDialog {
+  chat: TgChat;
+  lastMessageId: number;
+  /** Unix seconds. */
+  lastMessageDate: number;
+}
+
+export type TgMediaKind =
+  | "photo"
+  | "document"
+  | "voice"
+  | "audio"
+  | "video"
+  | "video_note"
+  | "sticker"
+  | "animation"
+  | "location"
+  | "contact"
+  | "poll"
+  | "webpage"
+  | "other";
+
+export interface TgMediaRef {
+  kind: TgMediaKind;
+  /** A Bot API compatible file id, which the adapter accepts back for download. */
+  fileId?: string;
+  mimeType?: string;
+  fileName?: string;
+  size?: number;
+  durationSec?: number;
+  /** View-once media (`ttl_seconds`): never stored. */
+  isViewOnce: boolean;
+  /** Poll question, venue title, web page URL: for rendering only. */
+  summary?: string;
+}
+
+export interface TgMessage {
+  chatId: number;
+  id: number;
+  box: MessageBox;
+  /** Unix seconds. */
+  date: number;
+  editDate?: number;
+  senderId?: number;
+  senderName?: string;
+  outgoing: boolean;
+  /** Message text as markdown. */
+  text: string;
+  replyToId?: number;
+  topicId?: number;
+  forwardFrom?: string;
+  groupedId?: string;
+  /** The chat's auto-delete timer, in seconds, when one applies to this message. */
+  ttlPeriod?: number;
+  media?: TgMediaRef;
+  /** A service message's action, e.g. `user_joined`, `message_pinned`. */
+  service?: string;
+}
+
+export type TgUpdate =
+  | { kind: "new"; message: TgMessage; chat: TgChat; users: TgUser[] }
+  | { kind: "edit"; message: TgMessage; chat: TgChat; users: TgUser[] }
+  /** The common box carries no chat id: Telegram names only the message ids. */
+  | { kind: "delete"; box: MessageBox; ids: number[] }
+  /** `channelDifferenceTooLong`, or a gap detected some other way. */
+  | { kind: "gap"; scope: "account" | { channelId: number } }
+  | { kind: "connection"; state: "offline" | "connecting" | "updating" | "connected" }
+  | { kind: "revoked"; reason: RevocationReason };
+
+/** The RPC errors that mean this authorization is gone for good. */
+export const REVOCATION_REASONS = [
+  "AUTH_KEY_UNREGISTERED",
+  "SESSION_REVOKED",
+  "SESSION_EXPIRED",
+  "USER_DEACTIVATED",
+  "USER_DEACTIVATED_BAN",
+  "AUTH_KEY_DUPLICATED",
+] as const;
+
+export type RevocationReason = (typeof REVOCATION_REASONS)[number];
+
+export function isRevocationReason(value: unknown): value is RevocationReason {
+  return typeof value === "string" && (REVOCATION_REASONS as readonly string[]).includes(value);
+}
+
+export type TelegramErrorCode =
+  | "flood-wait"
+  | "revoked"
+  | "file-reference-expired"
+  | "not-found"
+  | "forbidden"
+  | "network"
+  | "cancelled"
+  | "unknown";
+
+/** Every failure the adapter reports, already classified. */
+export class TelegramError extends Error {
+  constructor(
+    readonly code: TelegramErrorCode,
+    message: string,
+    readonly detail?: { seconds?: number; reason?: RevocationReason; rpc?: string },
+  ) {
+    super(message);
+    this.name = "TelegramError";
+  }
+}
+
+/** What the session reports to Telegram about this client. */
+export interface DeviceInfo {
+  deviceModel: string;
+  systemVersion: string;
+  appVersion: string;
+  langCode: string;
+}
+
+/** The operator's own `api_id` / `api_hash` from my.telegram.org. */
+export interface AppCredentials {
+  apiId: number;
+  apiHash: string;
+}
+
+/** A live, authorized client for one account. */
+export interface TelegramAdapter {
+  /**
+   * Import the session, connect, confirm the authorization with `getMe`, and
+   * start the updates loop with catch-up. Resolves to the account's own user.
+   * Calling it again on a connected adapter is an error.
+   */
+  connect(opts: { session: string; signal?: AbortSignal }): Promise<TgUser>;
+  /** The current session string; differs from the imported one after a DC migration. */
+  exportSession(): Promise<string>;
+  /**
+   * Confirm the authorization is still valid with one cheap request. Throws a
+   * `revoked` {@link TelegramError} (and emits `revoked`) when it is not.
+   * Exists because the updates loop stops silently on a revoked key.
+   */
+  checkAuthorization(opts?: { signal?: AbortSignal }): Promise<void>;
+  /** Stop updates, disconnect, and close the local cache. Idempotent. */
+  close(): Promise<void>;
+  /** Disconnect without tearing down; {@link resume} reconnects. Idempotent. */
+  suspend(): Promise<void>;
+  /** Reconnect after {@link suspend}. A no-op when not suspended. */
+  resume(): Promise<void>;
+  onUpdate(handler: (u: TgUpdate) => void): () => void;
+  iterDialogs(opts: { archived: "keep"; signal?: AbortSignal }): AsyncIterable<TgDialog>;
+  /** Newest→oldest page strictly older than offsetId (0 = newest); minId bounds the low end. */
+  getHistory(
+    chatId: number,
+    opts: { offsetId: number; limit: number; minId?: number; signal?: AbortSignal },
+  ): Promise<{ messages: TgMessage[]; users: TgUser[] }>;
+  /** Messages by id in one chat; `null` for an id that no longer exists. */
+  getMessages(chatId: number, ids: number[]): Promise<(TgMessage | null)[]>;
+  /** Messages by id in the common box, which needs no peer. */
+  getMessagesCommon(ids: number[]): Promise<(TgMessage | null)[]>;
+  download(
+    media: TgMediaRef,
+    opts: { maxBytes: number; signal?: AbortSignal },
+  ): Promise<Uint8Array>;
+  /** Phase 4. */
+  iterForumTopics(chatId: number): AsyncIterable<{ id: number; title: string }>;
+}
+
+/** A client used only to sign in. It keeps nothing on disk. */
+export interface TelegramAuthAdapter {
+  signInQr(opts: {
+    /** Called for every login URL; a rotation calls it again with a new one. */
+    onQr: (url: string, expires: Date) => void;
+    onScanned?: () => void;
+    /** Asked only when the account has a two-step password. */
+    password: () => Promise<string>;
+    /** Called after Telegram rejected the password; throw to stop retrying. */
+    onInvalidPassword: () => Promise<void>;
+    signal: AbortSignal;
+  }): Promise<{ self: TgUser; session: string }>;
+  /** End the authorization this client just created. */
+  logOut(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface AdapterFactory {
+  /**
+   * A client for a connected account. `storage.dir` is the account's own
+   * directory, which holds the connection cache; `storage.key` encrypts it,
+   * and `null` means this install keeps provider stores unencrypted.
+   */
+  live(
+    creds: AppCredentials,
+    storage: { dir: string; key: Buffer | null },
+    device: DeviceInfo,
+  ): TelegramAdapter;
+  auth(creds: AppCredentials, device: DeviceInfo): TelegramAuthAdapter;
+}

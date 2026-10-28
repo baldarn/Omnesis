@@ -12258,6 +12258,19 @@
       "value": "Message Content Intent",
       "paths": ["packages/providers/discord/src/source.test.ts"],
       "reason": "reviewed: invented Discord fixture (CLAUDE.md example names and made-up servers; Discord permission and header labels, not people)"
+    },
+    {
+      "value": "Maya Reeves",
+      "paths": [
+        "packages/providers/telegram/src/message-store.test.ts",
+        "packages/providers/telegram/src/provider.test.ts"
+      ],
+      "reason": "invented Telegram fixture user from the CLAUDE.md example set (packages/providers/telegram/src/testing/fixtures.ts)"
+    },
+    {
+      "value": "This Omnesis",
+      "paths": ["packages/providers/telegram/src/session-store.test.ts"],
+      "reason": "sentence start in a connection-state detail string, not a name"
     }
   ],
   "secretFixtures": [

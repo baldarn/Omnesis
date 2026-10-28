@@ -43,6 +43,7 @@
     { "path": "packages/providers/strava" },
     { "path": "packages/providers/things" },
     { "path": "packages/providers/web" },
+    { "path": "packages/providers/telegram" },
     { "path": "packages/providers/whatsapp" },
     { "path": "packages/providers-synth/_common" },
     { "path": "packages/providers-synth/android-call-log" },

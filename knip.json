@@ -122,6 +122,7 @@
         "@omnesis/provider-screen-time-synth",
         "@omnesis/provider-strava",
         "@omnesis/provider-strava-synth",
+        "@omnesis/provider-telegram",
         "@omnesis/provider-things",
         "@omnesis/provider-things-synth",
         "@omnesis/provider-whatsapp",
