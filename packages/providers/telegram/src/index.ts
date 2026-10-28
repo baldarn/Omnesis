@@ -16,14 +16,15 @@ import { DEFAULT_CONFIG_DIR, normalizePhone } from "@omnesis/core";
 import {
   config,
   defineProvider,
-  emptySync,
   type AccountDescriptor,
   type ProviderDefinition,
-  type SyncResult,
 } from "@omnesis/source-sdk";
 import { safePathSegment } from "@omnesis/types";
 import { loginFlow } from "./auth.js";
 import { telegramCredentialsSpec } from "./credentials-spec.js";
+import { telegramDocumentEventProfile } from "./document-event-profile.js";
+import { HISTORY_MIN_INTERVAL_MS, WALK_REQUESTS_PER_PAGE } from "./limits.js";
+import { TelegramMessagesSource } from "./messages.js";
 import { telegramIcon } from "./icons.js";
 import { inspectTelegramStores } from "./message-store.js";
 import { TelegramProvider } from "./provider.js";
@@ -37,6 +38,8 @@ export { loginFlow } from "./auth.js";
 export { telegramCredentialsSpec, loadAppCredentials } from "./credentials-spec.js";
 export { TelegramArchive, inspectTelegramStores } from "./message-store.js";
 export { telegramStateSpec } from "./state.js";
+export { TelegramMessagesSource, type TelegramMessagesSourceOptions } from "./messages.js";
+export { telegramDocumentEventProfile } from "./document-event-profile.js";
 export { telegramIcon, telegramIconDataUri } from "./icons.js";
 export { mapRpcError } from "./client/errors.js";
 export { TelegramError, REVOCATION_REASONS } from "./client/types.js";
@@ -80,6 +83,11 @@ async function describeAccount(id: string, configDir: string): Promise<AccountDe
     subject: phone ? { kind: "phone", value: phone } : { kind: "opaque", value: id },
     aliases: record?.username ? [{ kind: "handle", value: record.username }] : [],
   };
+}
+
+/** A validated config number (the host has already checked its range). */
+function positiveInt(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 export function buildTelegramProvider(
@@ -140,6 +148,7 @@ export function buildTelegramProvider(
         ownedWebDomains: ["web.telegram.org"],
         icon: telegramIcon,
         selfIdentity: { aliasPrefix: "telegram-user", accountPattern: "^\\d+$" },
+        documentEventProfile: telegramDocumentEventProfile,
         contract: { state: telegramStateSpec, outputRevision: 1 },
         config: config.object({
           includeChannels: config.boolean({
@@ -152,25 +161,51 @@ export function buildTelegramProvider(
             default: [],
             help: "Chat IDs or @usernames to skip. Already-archived content from them is removed. Leave empty to include every chat.",
           }),
+          historyRequestsPerPage: config.number({
+            label: "History requests per sync page",
+            default: WALK_REQUESTS_PER_PAGE,
+            min: 1,
+            max: 100,
+            integer: true,
+            advanced: true,
+            help: "How many history requests one sync page makes. Lower it if Telegram asks Omnesis to slow down.",
+          }),
+          historyMinIntervalMs: config.number({
+            label: "Delay between history requests (ms)",
+            default: HISTORY_MIN_INTERVAL_MS,
+            min: 250,
+            max: 60_000,
+            integer: true,
+            advanced: true,
+            help: "The least time between two history requests. Raise it if Telegram asks Omnesis to slow down.",
+          }),
         }),
 
-        create({ host, accountId }, provider) {
+        create({ host, accountId, sourceId, providerId, config: options, dataCutoff }, provider) {
           const configDir = host?.configDir;
           const stateDir =
             host?.stateDir ?? (configDir ? accountDir(configDir, accountId) : undefined);
+          const source = new TelegramMessagesSource(provider, {
+            sourceId,
+            providerId,
+            policy: {
+              includeChannels: options?.includeChannels === true,
+              excludedChats: Array.isArray(options?.excludedChats)
+                ? options.excludedChats.filter((c): c is string => typeof c === "string")
+                : [],
+            },
+            ...(dataCutoff ? { dataCutoff } : {}),
+            ...(host?.ingestion?.phoneRegion ? { phoneRegion: host.ingestion.phoneRegion } : {}),
+            walkLimits: {
+              requestsPerPage: positiveInt(options?.historyRequestsPerPage, WALK_REQUESTS_PER_PAGE),
+              minIntervalMs: positiveInt(options?.historyMinIntervalMs, HISTORY_MIN_INTERVAL_MS),
+            },
+          });
           return Promise.resolve({
             icon: telegramIcon,
-            async sync(cursor, opts): Promise<SyncResult<TelegramSyncCursor>> {
-              await provider.ensureUsable(opts?.signal);
-              // The history walk and the drain arrive with phase 2; until then a
-              // connected account has nothing to emit.
-              const prior = cursor ? telegramStateSpec.decode(cursor) : null;
-              return emptySync<TelegramSyncCursor>({
-                phase: "bootstrap",
-                committedSeq: prior?.storeId === provider.storeId ? prior.committedSeq : 0,
-                storeId: provider.storeId,
-              });
-            },
+            sync: (cursor, opts) => source.sync(cursor as TelegramSyncCursor | null, opts),
+            onPushEvent: (callback) => source.onPushEvent(callback),
+            onResync: () => source.onResync(),
             onSourceError: (callback) => provider.onSourceError(callback),
             suspend: () => provider.suspend(),
             resume: () => provider.resume(),

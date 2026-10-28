@@ -1,6 +1,6 @@
 # Telegram source: implementation design
 
-Status: phase 1 implemented (skeleton, auth, session, gate, registration); phases 2–4 to follow, issue omnesis-dev/Omnesis#517. Each phase is built by a separate agent. Every path is relative to the repo root. "VERIFY" marked an mtcute API or behaviour that could not be confirmed from the published 0.32.7 types; phase 1 resolved every phase-1 item against the installed package and recorded the answer where the item was, marked **Resolved (phase 1)**. Section 15 collects them, with the deviations phase 1 made from this design.
+Status: phases 1 (skeleton, auth, session, gate, registration) and 2 (text sync, edits, deletions, gaps, day documents, synthetic twin) implemented; phases 3–4 to follow, issue omnesis-dev/Omnesis#517. Each phase is built by a separate agent. Every path is relative to the repo root. "VERIFY" marked an mtcute API or behaviour that could not be confirmed from the published 0.32.7 types; phase 1 resolved every phase-1 item against the installed package and recorded the answer where the item was, marked **Resolved (phase 1)**. Section 15 collects them, with the deviations phases 1 and 2 made from this design (§15.10, §15.11).
 
 ---
 
@@ -316,7 +316,7 @@ All ids, names and phones are invented: `+1 (555) 010-01xx`, `example.com`.
 
 ### 5.1 Archive `<stateDir>/archive.db` (`TelegramArchive`)
 
-`stateDir` is the host's `<configDir>/telegram/<accountId>/`. **Resolved (phase 1):** `accountStateDir` in `packages/collector/src/source-host-builder.ts` is `join(configDir, safePathSegment(providerBaseId), safePathSegment(accountId))`, the same directory `providerAccountCredentialsPath("telegram", accountId)` writes the credential into, and the collector pre-creates it. Phase 1 implements the open, the encryption, the quarantine and the schema; the write and drain paths are phase 2.
+`stateDir` is the host's `<configDir>/telegram/<accountId>/`. **Resolved (phase 1):** `accountStateDir` in `packages/collector/src/source-host-builder.ts` is `join(configDir, safePathSegment(providerBaseId), safePathSegment(accountId))`, the same directory `providerAccountCredentialsPath("telegram", accountId)` writes the credential into, and the collector pre-creates it. Phase 1 implemented the open, the encryption, the quarantine and the schema; phase 2 the write and drain paths, and schema 2's additive columns (§15.11).
 
 Open, pragmas, encryption, plaintext-to-encrypted migration through a staging rekey, corrupt-file quarantine, and `inspect…` probe are copied from `packages/providers/whatsapp/src/message-store.ts` (`openStoreDatabase`, `migratePlaintextStore`, `inspectMessageStore`, `readStoreEncryptionKey`, `configurePragmas`). The key name is `telegram-store`.
 
@@ -505,7 +505,7 @@ mtcute does **not** report `updates.differenceTooLong`: it sets `pts` and logs a
    A `null` result is a deletion. A newer `editDate` is applied as an edit. `last_presence_check_at` is updated.
 
 3. Checkpoints (`reconcile_from_id = null`, `last_full_reconcile_at`) clear only in the transaction that wrote the results.
-4. Optional, VERIFY (phase 2): a log-manager hook that matches mtcute's differenceTooLong debug line (`updates.getDifference returned updates.differenceTooLong`, logged at DEBUG from the `updates` tag) and turns it into `gap: account`. The phase-1 adapter forwards only WARN and above, so the hook would need its own level handling. Correctness never depends on it.
+4. Optional, **not implemented (phase 2)**: a log-manager hook that matches mtcute's differenceTooLong debug line (`updates.getDifference returned updates.differenceTooLong`, logged at DEBUG from the `updates` tag) and turns it into `gap: account`. The phase-1 adapter forwards only WARN and above, so the hook would need its own level handling. Correctness never depends on it.
 
 ### 7.5 Exclusion and channel toggles
 
@@ -803,10 +803,10 @@ Deliverables: `history-walker.ts`, `message-extractor.ts` (text only), `normaliz
 
 Acceptance:
 
-- [ ] Every phase-2 test in section 13 passes, including the unseen-id deletion, gap reconcile and interrupted-resume tests.
-- [ ] `npm run validate-universes` passes; the E2E passes; `npm run checks:affected -- --base origin/main` is green.
-- [ ] Walk pacing is respected, by `calls` assertions with fake timers.
-- [ ] A `/source-review` pass with no blocking findings.
+- [x] Every phase-2 test in section 13 passes, including the unseen-id deletion, gap reconcile and interrupted-resume tests.
+- [x] `npm run validate-universes` passes; the E2E passes. `npm run checks:affected -- --base origin/main` could not run on the phase-2 host (no native dispatcher); its non-native steps were run by hand.
+- [x] Walk pacing is respected, by `calls` assertions with fake timers.
+- [x] A `/source-review` pass with no blocking findings left open (§15.11).
 
 ### Phase 3: media
 
@@ -852,7 +852,7 @@ Acceptance:
    - The better-sqlite3 13 override for `@mtcute/node`: works (D19).
    - `ttlSeconds` and `ttlPeriod`: `Message.ttlPeriod: number | null`; `ttlSeconds: number | null` on `Photo`, `Video` (which also covers round video notes) and `Voice` only. The adapter sets `TgMediaRef.isViewOnce` from it and `TgMessage.ttlPeriod` from the message.
    - File-id strings for `downloadAsBuffer`: accepted by type (`FileDownloadLocation = … | string`, "TDLib and Bot API compatible File ID"); `Photo` and every `RawDocument` expose `fileId`, and `FileDownloadParameters` takes `abortSignal` and `limit`. Not exercised against the network (phase 3 manual run).
-   - `tg://openmessage` behaviour on iOS and Android: not verifiable without devices; still open for phase 2 (section 8.4).
+   - `tg://openmessage` behaviour on iOS and Android: not verifiable without devices. Phase 2 emits no `tg://openmessage` link (section 8.4); still open.
 8. **VERIFY (phase 1), `host.stateDir` — resolved:** it equals `<configDir>/telegram/<accountId>` (section 5.1).
 9. **VERIFY (phase 4), Takeout:** how calls are wrapped through the takeout session, and its flood behaviour.
 10. **Phase 1 deviations and notes for later phases.**
@@ -866,3 +866,25 @@ Acceptance:
     - **Registration deferred with the synth twin.** The synth package, its root `tsconfig.json` reference, its collector `devDependency`, its `knip.json` entry and its `no-unit-test-projects.json` row arrive with the twin in phase 2. TRADEMARKS and THIRD_PARTY_NOTICES rows, the `docs/collector-storage.md` rows and the `docs/releasing.md` override note landed in phase 1 with the dependency. No website page changes yet (section 12 is phase 4).
     - **Fixture phones.** `normalizePhone` validates numbers, so the NANP fiction range `555-01xx` normalises only inside a real area code (`+1 202 555 01xx`); `+1 555 010 01xx` and the Ofcom drama range do not. Fixture user ids use `55501001xx`.
     - **Not run.** No real-account run was possible in phase 1: QR add, two-step password, restart without re-auth, and ending the session from a phone (expected: needs-auth) remain to be checked by hand.
+11. **Phase 2 deviations and notes for later phases.**
+    - **Schema 2.** Additive columns, applied by `ALTER TABLE` to an archive schema 1 created: `chats.last_message_ts` (the walk's "most recently active first" order, from the dialog list and live messages), `chats.reconcile_offset_id` (a forward re-page resumes where it stopped instead of re-reading from the top), `chats.presence_after_id` (a presence check resumes by id), `chats.outage_floor_id` (where a chat stood when the connection dropped), `users.is_deleted` (deleted accounts are not people), `messages.extract_rev` (the "older render" rule of §5.1: a row rewritten only by a newer `edit_ts` or a newer extractor revision) and `emitted_attachments.retired_seq` (a ledgered attachment the render dropped is retired with the page's `emitSeq` and leaves the ledger only when that page is acknowledged, so a failed page tombstones it again).
+    - **Walk state `failed`.** A chat Telegram refuses (`forbidden`, `not-found`, or an unclassified RPC error) is marked `failed`, skipped, reported as `partial` coverage, and offered again at the next full reconcile. Its gap floor, re-page offset and pending presence check are kept, and gap requests still floor it, so a refusal never loses a gap. A dialog listing that fails stops the page like a network error.
+    - **Gap floors.** An account-scope gap stores, for every walked chat, `reconcile_from_id = newest_seen_id` at the moment of the gap, because live updates after the gap move `newest_seen_id` past the hole and the §7.4 "lastMessageId > newest_seen_id" test would then miss it. The enumeration that follows clears a floor without a request when the dialog's top message is not above it. The periodic full reconcile uses only the dialog test.
+    - **Presence checks** run only after a gap (account-wide, a channel's `channelDifferenceTooLong`, or an outage), never on the periodic reconcile: a chat is due while `last_presence_check_at` is null, which a gap sets and a finished check clears. Chats without messages in the window cost no request.
+    - **Outages.** A live drop snapshots every walked chat's `newest_seen_id` into `outage_floor_id`, because the catch-up after a reconnect raises `newest_seen_id` before `connected` arrives; a reconnect after more than `GAP_SUSPECT_OUTAGE_S` floors the account reconcile there, a short one clears the snapshot. Connection events before the first connect resolves are ignored. Across restarts, `meta.last_online_at` (written at each connect, sync and reconnect) is compared **before** the client connects, so the floors sit below anything the startup catch-up delivers. A second gap also restarts a half-done presence check from the first id.
+    - **End of history.** mtcute's `getHistory` drops `messageEmpty` entries, so a short page is not the end: the backward walk and a forward re-page stop on an empty page (or the data cutoff), at the cost of one extra request per chat.
+    - **Same-second edits.** Telegram's edit dates are whole seconds, so an upsert with an equal `edit_ts` and different text or media also rewrites the row; an identical re-read still changes nothing.
+    - **`hasMore`** is `morePending` or a walk that stopped on its request budget. A walk stopped by the deadline margin, a flood wait, the network or a cancellation waits for the next scheduled or pushed sync, so a run always ends. Pending reconcile work is spent through the same budget, so it is covered.
+    - **Phase and coverage** stay `bootstrap` / `unknown` until the dialog list has been read once (`meta.dialogs_listed_at`), so an account whose first page stopped before listing does not claim a complete history.
+    - **Rendering.** Times are UTC `HH:MM`, like the day boundary (WhatsApp renders local time). A forward renders as a `(forwarded from X)` prefix; a reply quote is omitted when the archive does not hold its target; link previews (`webpage`) have no placeholder because the URL is in the text; animations render as `[GIF]`; kept service messages render as `_Sender pinned a message_`. Media is a placeholder with metadata only; `media_json` keeps the descriptor, including the file id phase 3 downloads with.
+    - **Extraction.** Besides `ttlPeriod` and view-once media, the extractor drops empty messages and every service action outside a short list of meaningful ones (`SERVICE_PHRASES` in `message-extractor.ts`); a dropped message still advances the checkpoint and `newest_seen_id`.
+    - **People** use `identifiers` (the non-deprecated form) for LIDs and phones. Senders with a non-positive id (a channel posting as itself, an anonymous admin) are not people. The universe's phones sit in the validator's `+1 555 01xx` range, which `normalizePhone` rejects (§15.10), so the E2E pairs self through the `selfIdentity` LID alone; the gateway creates a self person only from an identifier, so the E2E config gives self an email.
+    - **Document event profile** declares only `conversation` until phase 3 emits attachment documents; a declared type no document carries would compile conditions that never fire. Phase 3 adds `attachment` with its parity test.
+    - **Links.** No `tg://openmessage` is emitted (unvalidated, §15.7); basic groups, Saved Messages and private chats without a username carry no link. A supergroup, forum or channel message link is the `sourceUrl` only: `appUrl` is for a native scheme, and an `https://t.me` link already opens the app where it is installed (§8.4 said "same").
+    - **Rate limits.** A flood wait surfacing at the sync boundary (the per-page authorization check) is a `SyncError("rate-limit")` with `quota: { kind: "account" }`: Telegram counts it against the signed-in account, not the shared app credential.
+    - **Data cutoff.** Messages older than `dataCutoff` are neither stored (by the walk or by live updates) nor published by the drain; a day entirely before the cutoff is skipped, not tombstoned (WhatsApp semantics).
+    - **Config.** Two `advanced` fields, `historyRequestsPerPage` and `historyMinIntervalMs`, override `WALK_REQUESTS_PER_PAGE` and `HISTORY_MIN_INTERVAL_MS`. A config change rebuilds the source; the next page applies exclusions (purge or restore) before walking.
+    - **Drain order** is most recent day first (WhatsApp drains oldest first), matching the walk's recent-first order.
+    - **Adapter fixes found by the new conversion tests** (`client/mtcute/adapter.test.ts`, mtcute objects built from raw TL): a message that fails to convert becomes a text-less stub so the walk's checkpoint still moves past it; a forward header naming nobody no longer throws; a forum topic's header is a topic id, not a reply; a reply into another chat is not a reply here; TL boolean flags absent from an object read as `false`.
+    - **Synthetic twin.** `packages/providers-synth/telegram` has no fixture-replay mode: `discover()` reports the universe self account only when the universe ships `sources/telegram-messages/fake-corpus.json`, and `createContext` seeds an invented app credential and a session the simulated server accepts (`SimulatedTelegram.seedAccount`) before the real context opens. Like every double it drops the real `contract.state` (`synth-double-isolation.test.ts` pins this); the real source still decodes its own cursor inside `sync()`.
+    - **Left for phase 3:** media download, transcription, attachment documents and the `attachment` profile type; the ledger mechanics they rely on (`settleAttachments`, retirement, tombstones) are in place and tested. **Left for phase 4:** the topic prefix and `extra.topics` (rows already keep `topic_id`), Takeout, website docs.

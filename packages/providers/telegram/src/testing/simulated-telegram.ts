@@ -13,16 +13,21 @@
  * Waiting is done with `setTimeout`, so fake timers drive it. Every name,
  * number and id in a corpus built here must be invented.
  *
- * Phase 1 covers sign-in, connect, revocation and the connection lifecycle;
- * the history and update scripting (`pushNew`, `dropUpdates`, `setMedia`, …)
- * arrive with the history walk.
+ * The corpus is the server's state: `pushNew`, `pushEdit` and `pushDelete`
+ * change it and deliver the matching live update, so a later history read
+ * agrees with what the updates said — unless `dropUpdates` lost them, which
+ * is how a test makes a gap. Media downloads arrive with phase 3.
  */
 
+import { writeProviderCredentials } from "@omnesis/core";
+import { TELEGRAM_FILE_KEY } from "../credentials-spec.js";
+import { writeSessionRecord } from "../session-store.js";
 import {
   TelegramError,
   type AdapterFactory,
   type AppCredentials,
   type DeviceInfo,
+  type MessageBox,
   type RevocationReason,
   type TelegramAdapter,
   type TelegramAuthAdapter,
@@ -33,6 +38,10 @@ import {
   type TgUpdate,
   type TgUser,
 } from "../client/types.js";
+
+/** The invented app credential a seeded account uses. */
+const SIMULATED_API_ID = "1234567";
+const SIMULATED_API_HASH = "0123456789abcdef0123456789abcdef";
 
 /** How long a simulated login code lives before it rotates on its own. */
 export const SIMULATED_QR_TTL_MS = 30_000;
@@ -46,6 +55,22 @@ export interface SimulatedCorpus {
 export interface SimulatedCall {
   method: string;
   args?: unknown;
+  /** `Date.now()` when the request was served, for pacing assertions. */
+  at: number;
+}
+
+/** What a test says about a new message; the server fills in the rest. */
+export interface NewMessageInput {
+  text?: string;
+  /** Defaults to the other user of a private chat, else the account itself. */
+  senderId?: number;
+  outgoing?: boolean;
+  /** Unix seconds; defaults to now. */
+  date?: number;
+  replyToId?: number;
+  media?: TgMediaRef;
+  ttlPeriod?: number;
+  service?: string;
 }
 
 type Waiter = { resolve: () => void; reject: (err: unknown) => void };
@@ -68,6 +93,7 @@ export class SimulatedTelegram {
   private password: string | undefined;
   private qrCounter = 0;
   private pendingLogin: { waiter: Waiter; scannedBy?: number; rotate: () => void } | undefined;
+  private droppedUpdates = 0;
 
   constructor(corpus: SimulatedCorpus) {
     this.addAccount(corpus);
@@ -98,6 +124,31 @@ export class SimulatedTelegram {
     const session = `sim-session:${userId}:${++this.sessionCounter}`;
     this.sessions.set(session, { userId });
     return session;
+  }
+
+  /**
+   * Leave `configDir` as a completed sign-in of `userId` would: an invented
+   * app credential and a stored session this server accepts. What the
+   * synthetic twin does instead of a QR scan.
+   */
+  async seedAccount(configDir: string, userId: number): Promise<void> {
+    const self = this.account(userId).self;
+    await writeProviderCredentials(
+      TELEGRAM_FILE_KEY,
+      { api_id: SIMULATED_API_ID, api_hash: SIMULATED_API_HASH },
+      configDir,
+    );
+    await writeSessionRecord(
+      {
+        session: this.issueSession(userId),
+        userId: String(userId),
+        apiId: SIMULATED_API_ID,
+        ...(self.phone ? { phone: self.phone } : {}),
+        ...(self.username ? { username: self.username } : {}),
+        connectedAt: new Date().toISOString(),
+      },
+      configDir,
+    );
   }
 
   /** Whether a session is still valid. */
@@ -157,16 +208,156 @@ export class SimulatedTelegram {
     );
   }
 
-  /** Deliver an update to every live adapter. */
+  /** Deliver an update to every live adapter, unless it is one `dropUpdates` loses. */
   emit(update: TgUpdate): void {
+    if (this.droppedUpdates > 0 && update.kind !== "connection" && update.kind !== "revoked") {
+      this.droppedUpdates--;
+      return;
+    }
     for (const adapter of this.liveAdapters) adapter.deliver(update);
+  }
+
+  /** Lose the next `n` message updates, as a long disconnection would. */
+  dropUpdates(n: number): void {
+    this.droppedUpdates += n;
+  }
+
+  /** Report an update gap, as `channelDifferenceTooLong` does. */
+  emitGap(scope: "account" | { channelId: number }): void {
+    this.emit({ kind: "gap", scope });
+  }
+
+  /** Report a connection state change. */
+  setConnectionState(state: "offline" | "connecting" | "updating" | "connected"): void {
+    this.emit({ kind: "connection", state });
+  }
+
+  /**
+   * Post a message to a chat of `ownerId`'s account (the first account by
+   * default) and deliver it live. Returns the stored message.
+   */
+  pushNew(chatId: number, input: NewMessageInput, ownerId?: number): TgMessage {
+    const account = this.ownerAccount(ownerId);
+    const entry = this.chatEntry(account, chatId);
+    const { chat } = entry;
+    const box = chatBox(chat);
+    const all = (account.chats ?? []).flatMap((c) => c.messages);
+    const id =
+      Math.max(
+        0,
+        ...(box === "common" ? all.filter((m) => m.box === "common") : entry.messages).map(
+          (m) => m.id,
+        ),
+      ) + 1;
+    const outgoing = input.outgoing ?? input.senderId === account.self.id;
+    const senderId =
+      input.senderId ??
+      (outgoing ? account.self.id : chat.kind === "private" ? chat.id : account.self.id);
+    const sender = [account.self, ...(account.users ?? [])].find((u) => u.id === senderId);
+    const message: TgMessage = {
+      chatId,
+      id,
+      box,
+      date: input.date ?? Math.floor(Date.now() / 1000),
+      senderId,
+      ...(sender
+        ? { senderName: [sender.firstName, sender.lastName].filter(Boolean).join(" ") }
+        : {}),
+      outgoing,
+      text: input.text ?? "",
+      ...(input.replyToId ? { replyToId: input.replyToId } : {}),
+      ...(input.media ? { media: input.media } : {}),
+      ...(input.ttlPeriod ? { ttlPeriod: input.ttlPeriod } : {}),
+      ...(input.service ? { service: input.service } : {}),
+    };
+    entry.messages.push(message);
+    this.emit({
+      kind: "new",
+      message,
+      chat: liveChat(chat),
+      users: this.usersOf(account, [message], chat),
+    });
+    return message;
+  }
+
+  /** Edit a message server-side and deliver the edit live. */
+  pushEdit(
+    chatId: number,
+    id: number,
+    text: string,
+    editDate?: number,
+    ownerId?: number,
+  ): TgMessage {
+    const account = this.ownerAccount(ownerId);
+    const entry = this.chatEntry(account, chatId);
+    const index = entry.messages.findIndex((m) => m.id === id);
+    if (index < 0) throw new Error(`No simulated message ${id} in chat ${chatId}`);
+    const edited: TgMessage = {
+      ...entry.messages[index]!,
+      text,
+      editDate: editDate ?? Math.floor(Date.now() / 1000),
+    };
+    entry.messages[index] = edited;
+    this.emit({
+      kind: "edit",
+      message: edited,
+      chat: liveChat(entry.chat),
+      users: this.usersOf(account, [edited], entry.chat),
+    });
+    return edited;
+  }
+
+  /**
+   * Delete messages server-side and deliver the deletion live. For a private
+   * chat or basic group the update names no chat, as Telegram's does.
+   */
+  pushDelete(chatId: number, ids: number[], ownerId?: number): void {
+    const account = this.ownerAccount(ownerId);
+    const entry = this.chatEntry(account, chatId);
+    entry.messages = entry.messages.filter((m) => !ids.includes(m.id));
+    this.emit({ kind: "delete", box: chatBox(entry.chat), ids });
+  }
+
+  /** Change a message server-side without telling anyone (an update lost in a gap). */
+  silentlyEdit(chatId: number, id: number, text: string, editDate: number, ownerId?: number): void {
+    const entry = this.chatEntry(this.ownerAccount(ownerId), chatId);
+    const index = entry.messages.findIndex((m) => m.id === id);
+    if (index < 0) throw new Error(`No simulated message ${id} in chat ${chatId}`);
+    entry.messages[index] = { ...entry.messages[index]!, text, editDate };
+  }
+
+  private ownerAccount(ownerId: number | undefined): SimulatedCorpus {
+    if (ownerId !== undefined) return this.account(ownerId);
+    const first = this.accounts.values().next().value;
+    if (!first) throw new Error("No simulated account");
+    return first;
+  }
+
+  private chatEntry(
+    account: SimulatedCorpus,
+    chatId: number,
+  ): { chat: TgChat; messages: TgMessage[] } {
+    const entry = account.chats?.find((c) => c.chat.id === chatId);
+    if (!entry) throw new Error(`No simulated chat ${chatId}`);
+    return entry;
+  }
+
+  /** @internal The users a page or an update carries: its senders and a private chat's peer. */
+  usersOf(account: SimulatedCorpus, messages: readonly TgMessage[], chat?: TgChat): TgUser[] {
+    const ids = new Set<number>(
+      messages.flatMap((m) => (m.senderId !== undefined ? [m.senderId] : [])),
+    );
+    if (chat?.kind === "private") ids.add(chat.id);
+    return [account.self, ...(account.users ?? [])].filter((u) => ids.has(u.id));
   }
 
   // ── Internals the adapters use ──────────────────────────────────────
 
   /** @internal */
   record(method: string, args?: unknown): void {
-    this.calls.push(args === undefined ? { method } : { method, args });
+    this.calls.push(
+      args === undefined ? { method, at: Date.now() } : { method, args, at: Date.now() },
+    );
     const queued = this.failures.get(method);
     const failure = queued?.shift();
     if (failure) throw failure;
@@ -315,13 +506,20 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
 
   async *iterDialogs(): AsyncIterable<TgDialog> {
     const userId = await this.request("iterDialogs", () => this.authorizeCurrent());
-    for (const { chat, messages } of this.server.account(userId).chats ?? []) {
+    // Most recently active first, as Telegram orders its dialog list.
+    const dialogs = (this.server.account(userId).chats ?? []).map(({ chat, messages }) => {
       const last = messages.reduce<TgMessage | undefined>(
         (a, m) => (!a || m.id > a.id ? m : a),
         undefined,
       );
-      yield { chat, lastMessageId: last?.id ?? 0, lastMessageDate: last?.date ?? 0 };
-    }
+      return {
+        chat: { ...chat, topMessageId: last?.id ?? 0 },
+        lastMessageId: last?.id ?? 0,
+        lastMessageDate: last?.date ?? 0,
+      };
+    });
+    dialogs.sort((a, b) => b.lastMessageDate - a.lastMessageDate);
+    yield* dialogs;
   }
 
   getHistory(
@@ -337,8 +535,7 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
           .filter((m) => (opts.offsetId === 0 || m.id < opts.offsetId) && m.id > (opts.minId ?? 0))
           .sort((a, b) => b.id - a.id)
           .slice(0, opts.limit);
-        const ids = new Set(messages.map((m) => m.senderId));
-        return { messages, users: (corpus.users ?? []).filter((u) => ids.has(u.id)) };
+        return { messages, users: this.server.usersOf(corpus, messages, chat?.chat) };
       },
       { chatId, ...opts },
     );
@@ -418,6 +615,18 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
       }, 0);
     });
   }
+}
+
+/** Where a chat's ids live, as the real adapter reports it. */
+function chatBox(chat: TgChat): MessageBox {
+  return chat.kind === "supergroup" || chat.kind === "forum" || chat.kind === "channel"
+    ? `channel:${chat.id}`
+    : "common";
+}
+
+/** A chat as a live update carries it: Telegram's updates do not say whether it is archived. */
+function liveChat(chat: TgChat): TgChat {
+  return { ...chat, isArchived: false };
 }
 
 class SimulatedAuthAdapter implements TelegramAuthAdapter {

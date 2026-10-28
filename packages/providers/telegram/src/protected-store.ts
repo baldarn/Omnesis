@@ -42,7 +42,7 @@ import type { LocalStoreProbeResult } from "@omnesis/source-sdk";
 export type Db = Database.Database;
 
 /** The live-storage key both files open with. */
-export const TELEGRAM_STORE_KEY = "telegram-store";
+const TELEGRAM_STORE_KEY = "telegram-store";
 
 const log = createLogger("provider:telegram").child("store");
 const SQLITE_HEADER = Buffer.from("SQLite format 3\0", "utf8");

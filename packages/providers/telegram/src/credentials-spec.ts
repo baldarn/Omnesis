@@ -7,7 +7,7 @@ import type { AppCredentials } from "./client/types.js";
 
 /** Where the app credential lives: `<configDir>/telegram-credentials.json`. */
 export const TELEGRAM_FILE_KEY = "telegram";
-export const TELEGRAM_PROVIDER_NAME = "Telegram";
+const TELEGRAM_PROVIDER_NAME = "Telegram";
 
 const API_ID_PATTERN = "^\\d+$";
 const API_HASH_PATTERN = "^[0-9a-f]{32}$";

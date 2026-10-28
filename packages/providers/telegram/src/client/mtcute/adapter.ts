@@ -25,6 +25,7 @@ import {
   BaseTelegramClient,
   MemoryStorage,
   TelegramClient,
+  getMarkedPeerId,
   md,
   networkMiddlewares,
   tl,
@@ -103,7 +104,7 @@ function formatMtcuteLog(fmt: string, args: unknown[]): string {
 }
 
 /** Any error out of mtcute, classified. */
-export function toTelegramError(err: unknown): TelegramError {
+function toTelegramError(err: unknown): TelegramError {
   if (err instanceof TelegramError) return err;
   if (tl.RpcError.is(err)) {
     const seconds = (err as { seconds?: unknown }).seconds;
@@ -238,19 +239,19 @@ class MtcuteTelegramAdapter implements TelegramAdapter {
         ...(opts.minId ? { minId: opts.minId } : {}),
       });
       const self = this.requireSelf();
-      return { messages: page.map((m) => toTgMessage(m)), users: sendersOf(page, self) };
+      return { messages: page.map((m) => convertMessage(m)), users: sendersOf(page, self) };
     });
   }
 
   getMessages(chatId: number, ids: number[]): Promise<(TgMessage | null)[]> {
     return this.guard(async () =>
-      (await this.client.getMessages(chatId, ids)).map((m) => (m ? toTgMessage(m) : null)),
+      (await this.client.getMessages(chatId, ids)).map((m) => (m ? convertMessage(m) : null)),
     );
   }
 
   getMessagesCommon(ids: number[]): Promise<(TgMessage | null)[]> {
     return this.guard(async () =>
-      (await this.client.getMessagesUnsafe(ids)).map((m) => (m ? toTgMessage(m) : null)),
+      (await this.client.getMessagesUnsafe(ids)).map((m) => (m ? convertMessage(m) : null)),
     );
   }
 
@@ -386,9 +387,12 @@ export const mtcuteAdapterFactory: AdapterFactory = {
 };
 
 // ── Conversion ─────────────────────────────────────────────────────────
+//
+// Pure functions from mtcute's parsed objects to the boundary DTOs, exported
+// for `adapter.test.ts`, which builds mtcute objects from raw TL.
 
 /** mtcute reports a bare channel id to `onChannelTooLong`; everything else is marked. */
-function markChannelId(bare: number): number {
+export function markChannelId(bare: number): number {
   return -1_000_000_000_000 - bare;
 }
 
@@ -399,9 +403,10 @@ function toTgUser(u: User, selfId: number): TgUser {
     lastName: u.lastName ?? undefined,
     username: u.username ?? undefined,
     phone: u.phoneNumber ?? undefined,
-    isBot: u.isBot,
-    isDeleted: u.isDeleted,
-    isSelf: u.isSelf || u.id === selfId,
+    // TL flags are absent rather than false when unset.
+    isBot: u.isBot === true,
+    isDeleted: u.isDeleted === true,
+    isSelf: u.isSelf === true || u.id === selfId,
   };
 }
 
@@ -409,14 +414,14 @@ function isChannelPeer(chat: Chat): boolean {
   return chat.raw._ === "channel" || chat.raw._ === "channelForbidden";
 }
 
-function chatKind(peer: Peer, selfId: number): ChatKind {
+export function chatKind(peer: Peer, selfId: number): ChatKind {
   if (peer.type === "user") return peer.id === selfId ? "saved" : "private";
   if (!isChannelPeer(peer)) return "group";
   if (peer.chatType === "channel") return "channel";
   return peer.isForum ? "forum" : "supergroup";
 }
 
-function toTgChat(
+export function toTgChat(
   peer: Peer,
   selfId: number,
   extra: { isArchived: boolean; topMessageId: number },
@@ -433,7 +438,7 @@ function toTgChat(
   };
 }
 
-function toTgDialog(dialog: Dialog, selfId: number): TgDialog {
+export function toTgDialog(dialog: Dialog, selfId: number): TgDialog {
   const last = dialog.lastMessage;
   const topMessageId = last?.id ?? 0;
   return {
@@ -447,10 +452,53 @@ function boxOf(chat: Peer): MessageBox {
   return chat.type === "chat" && isChannelPeer(chat) ? `channel:${chat.id}` : "common";
 }
 
-function toTgMessage(msg: Message): TgMessage {
-  const sender = msg.sender;
+/**
+ * A message that cannot be converted still occupies its id: a stub with no
+ * text keeps the walk's checkpoint moving past it, and the extractor drops it.
+ */
+export function convertMessage(msg: Message): TgMessage {
+  try {
+    return toTgMessage(msg);
+  } catch (err) {
+    log.warn(`Could not convert Telegram message ${msg.raw.id}: ${toErrorMessage(err)}`);
+    const peer = msg.raw.peerId;
+    const chatId = getMarkedPeerId(peer);
+    return {
+      chatId,
+      id: msg.raw.id,
+      box: peer._ === "peerChannel" ? `channel:${chatId}` : "common",
+      date: msg.raw.date,
+      outgoing: false,
+      text: "",
+    };
+  }
+}
+
+/** Who a forward came from; a forward header naming nobody is answered with nothing. */
+function forwardName(msg: Message): string | undefined {
+  try {
+    return msg.forward?.sender.displayName || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The message this one replies to, in the same chat. In a forum topic the
+ * reply header always names the topic; it is a reply only when it also names
+ * a message other than the topic's root.
+ */
+function replyTarget(msg: Message): { replyToId?: number; topicId?: number } {
   const reply = msg.replyToMessage;
-  const forward = msg.forward;
+  if (!reply?.id) return {};
+  const topicId = msg.isTopicMessage ? (reply.threadId ?? reply.id) : undefined;
+  const isReply = reply.origin === "same_chat" && reply.id !== topicId;
+  return { ...(isReply ? { replyToId: reply.id } : {}), ...(topicId ? { topicId } : {}) };
+}
+
+export function toTgMessage(msg: Message): TgMessage {
+  const sender = msg.sender;
+  const forwardFrom = forwardName(msg);
   const media = toTgMedia(msg.media);
   return {
     chatId: msg.chat.id,
@@ -460,11 +508,10 @@ function toTgMessage(msg: Message): TgMessage {
     ...(msg.editDate ? { editDate: Math.floor(msg.editDate.getTime() / 1000) } : {}),
     senderId: sender.id,
     senderName: sender.displayName,
-    outgoing: msg.isOutgoing,
+    outgoing: msg.isOutgoing === true,
     text: msg.text ? md.unparse(msg.textWithEntities) : "",
-    ...(reply?.id ? { replyToId: reply.id } : {}),
-    ...(msg.isTopicMessage && reply ? { topicId: reply.threadId ?? reply.id ?? undefined } : {}),
-    ...(forward ? { forwardFrom: forward.sender.displayName } : {}),
+    ...replyTarget(msg),
+    ...(forwardFrom ? { forwardFrom } : {}),
     ...(msg.groupedIdUnique ? { groupedId: msg.groupedIdUnique } : {}),
     ...(msg.ttlPeriod ? { ttlPeriod: msg.ttlPeriod } : {}),
     ...(media ? { media } : {}),
@@ -472,7 +519,7 @@ function toTgMessage(msg: Message): TgMessage {
   };
 }
 
-function sendersOf(messages: readonly Message[], selfId: number): TgUser[] {
+export function sendersOf(messages: readonly Message[], selfId: number): TgUser[] {
   const users = new Map<number, TgUser>();
   for (const m of messages) {
     if (m.sender.type === "user") users.set(m.sender.id, toTgUser(m.sender, selfId));

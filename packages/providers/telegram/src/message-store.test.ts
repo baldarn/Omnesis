@@ -16,7 +16,21 @@ import { readTelegramStoreKey, StoreKeyUnavailableError } from "./protected-stor
 import { TelegramProvider } from "./provider.js";
 import { writeSessionRecord } from "./session-store.js";
 import { SimulatedTelegram } from "./testing/simulated-telegram.js";
-import { SELF, tempConfigDir, writeAppCredentials } from "./testing/fixtures.js";
+import {
+  HELPER_BOT,
+  JAMIE,
+  SELF,
+  T0,
+  chatOf,
+  messageIn,
+  privateChatWith,
+  tempConfigDir,
+  writeAppCredentials,
+} from "./testing/fixtures.js";
+import { extractMessage } from "./message-extractor.js";
+import type { DrainedDay } from "./message-store.js";
+import type { TgChat } from "./client/types.js";
+import type { StoredMessage } from "./types.js";
 
 const HEADER = "SQLite format 3\0";
 const ACCOUNT = String(SELF.id);
@@ -83,7 +97,7 @@ describe("TelegramArchive storage", () => {
     }
     const reopened = openArchive();
     expect(reopened.storeId).toBe(id);
-    expect(reopened.getMeta("schema_version")).toBe("1");
+    expect(reopened.getMeta("schema_version")).toBe("2");
     reopened.close();
   });
 
@@ -166,5 +180,187 @@ describe("TelegramArchive storage", () => {
     expect(archive.storeId).toMatch(/^[0-9a-f-]{36}$/u);
     archive.close();
     expect(readdirSync(stateDir).some((f) => f.startsWith("archive.db.corrupt-"))).toBe(true);
+  });
+});
+
+describe("TelegramArchive writes and drain", () => {
+  let dir: string;
+  let clock: number;
+  let archive: TelegramArchive;
+  const chat: TgChat = privateChatWith(JAMIE);
+  const channel: TgChat = chatOf(-1003000000003, "supergroup", "Studio Northstar crew");
+
+  beforeEach(() => {
+    dir = tempConfigDir("archive-writes");
+    clock = T0 + 86_400;
+    archive = TelegramArchive.open(dir, null, { now: () => clock });
+  });
+
+  afterEach(() => {
+    archive.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function stored(
+    c: TgChat,
+    id: number,
+    ts: number,
+    text: string,
+    extra: Partial<StoredMessage> = {},
+  ): StoredMessage {
+    const m = extractMessage(messageIn(c, id, ts, text, { senderId: JAMIE.id }))!;
+    return { ...m, ...extra };
+  }
+
+  function live(c: TgChat, m: StoredMessage): boolean {
+    return archive.storeLive(c, [JAMIE], m, { id: m.msgId, date: m.ts }, true);
+  }
+
+  /** Drain everything pending and acknowledge it, returning what was drained. */
+  function drainAll(): DrainedDay[] {
+    const first = archive.drain({ committedSeq: 0, limit: 100 });
+    archive.drain({ committedSeq: first.emitSeq, limit: 100 });
+    return first.days;
+  }
+
+  it("marks a day dirty on an edit only when the edit is newer", () => {
+    live(chat, stored(chat, 1, T0, "Q4 budget review at ten"));
+    drainAll();
+    expect(live(chat, stored(chat, 1, T0, "Q4 budget review at ten"))).toBe(false);
+    expect(archive.dirtyDayCount()).toBe(0);
+    expect(live(chat, stored(chat, 1, T0, "Q4 budget review at eleven", { editTs: T0 + 60 }))).toBe(
+      true,
+    );
+    const [day] = archive.drain({ committedSeq: 0, limit: 10 }).days;
+    expect(day?.messages[0]).toMatchObject({ text: "Q4 budget review at eleven", editTs: T0 + 60 });
+    // An older copy of the message (a late walk page) does not undo the edit.
+    expect(live(chat, stored(chat, 1, T0, "Q4 budget review at ten"))).toBe(false);
+    expect(archive.getMessages(chat.id, [1]).get(1)?.text).toBe("Q4 budget review at eleven");
+  });
+
+  it("keeps the later of two edits made in the same second", () => {
+    live(chat, stored(chat, 1, T0, "Draft"));
+    live(chat, stored(chat, 1, T0, "First fix", { editTs: T0 + 60 }));
+    drainAll();
+    expect(live(chat, stored(chat, 1, T0, "Second fix", { editTs: T0 + 60 }))).toBe(true);
+    expect(archive.getMessages(chat.id, [1]).get(1)?.text).toBe("Second fix");
+    // The same content again is still a no-op.
+    drainAll();
+    expect(live(chat, stored(chat, 1, T0, "Second fix", { editTs: T0 + 60 }))).toBe(false);
+  });
+
+  it("deletes a common-box message through the id index, with no chat named", () => {
+    live(chat, stored(chat, 7, T0, "Marathon entry form attached"));
+    drainAll();
+    expect(archive.deleteMessages("common", [7])).toBe(1);
+    const { days } = archive.drain({ committedSeq: 0, limit: 10 });
+    expect(days).toEqual([{ chatId: chat.id, date: "2026-03-10", messages: [], ledger: [] }]);
+  });
+
+  it("deletes a channel message only in its own box", () => {
+    live(chat, stored(chat, 5, T0, "Private note five"));
+    live(channel, stored(channel, 5, T0, "Group note five"));
+    drainAll();
+    expect(archive.deleteMessages(`channel:${channel.id}`, [5])).toBe(1);
+    expect(archive.hasMessage(channel.id, 5)).toBe(false);
+    expect(archive.hasMessage(chat.id, 5)).toBe(true);
+  });
+
+  it("applies a deletion that arrived before its message when the message arrives", () => {
+    expect(archive.deleteMessages("common", [42])).toBe(0);
+    expect(archive.pendingDeletionCount()).toBe(1);
+    // The walk then delivers the message: it is stored deleted and never published.
+    archive.commitWalkPage(chat.id, {
+      messages: [stored(chat, 42, T0, "Already gone"), stored(chat, 41, T0 - 60, "Still here")],
+      users: [JAMIE],
+      rawIds: [42, 41],
+      done: true,
+    });
+    expect(archive.pendingDeletionCount()).toBe(0);
+    expect(archive.hasMessage(chat.id, 42)).toBe(false);
+    const { days } = archive.drain({ committedSeq: 0, limit: 10 });
+    expect(days[0]?.messages.map((m) => m.msgId)).toEqual([41]);
+  });
+
+  it("forgets an unmatched deletion after the pending window", () => {
+    archive.deleteMessages("common", [99]);
+    clock += 31 * 86_400;
+    archive.drain({ committedSeq: 0, limit: 10 });
+    expect(archive.pendingDeletionCount()).toBe(0);
+    live(chat, stored(chat, 99, T0, "Arrived much later"));
+    expect(archive.hasMessage(chat.id, 99)).toBe(true);
+  });
+
+  it("re-emits until the gateway acknowledges, and treats a foreign sequence as nothing acknowledged", () => {
+    live(chat, stored(chat, 1, T0, "Riverside Estate visit"));
+    const first = archive.drain({ committedSeq: 0, limit: 10 });
+    expect(first.days).toHaveLength(1);
+    // The page failed: the cursor did not advance, so the day comes back.
+    const retry = archive.drain({ committedSeq: 0, limit: 10 });
+    expect(retry.days.map((d) => d.date)).toEqual(["2026-03-10"]);
+    expect(retry.emitSeq).toBeGreaterThan(first.emitSeq);
+    // A sequence this archive never issued (another archive's cursor) acknowledges nothing.
+    expect(archive.drain({ committedSeq: 10_000, limit: 10 }).days).toHaveLength(1);
+    const last = archive.drain({ committedSeq: 0, limit: 10 });
+    expect(archive.drain({ committedSeq: last.emitSeq, limit: 10 }).days).toHaveLength(0);
+    expect(archive.dirtyDayCount()).toBe(0);
+  });
+
+  it("pages the drain and reports more pending", () => {
+    for (let d = 0; d < 5; d++) live(chat, stored(chat, d + 1, T0 + d * 86_400, `Day ${d}`));
+    const page = archive.drain({ committedSeq: 0, limit: 2 });
+    expect(page.days.map((d) => d.date)).toEqual(["2026-03-14", "2026-03-13"]);
+    expect(page.morePending).toBe(true);
+  });
+
+  it("retires ledgered attachments a render no longer produces, until that page is acknowledged", () => {
+    live(chat, stored(chat, 1, T0, "Floor plan"));
+    const first = archive.drain({ committedSeq: 0, limit: 10 });
+    archive.settleAttachments(chat.id, "2026-03-10", ["day/att/a", "day/att/b"], first.emitSeq);
+    archive.deleteMessages("common", [1]);
+    const second = archive.drain({ committedSeq: first.emitSeq, limit: 10 });
+    expect(second.days[0]?.ledger).toEqual(["day/att/a", "day/att/b"]);
+    expect(archive.settleAttachments(chat.id, "2026-03-10", [], second.emitSeq)).toEqual([
+      "day/att/a",
+      "day/att/b",
+    ]);
+    // Not acknowledged: the day and its retired attachments come back.
+    const retry = archive.drain({ committedSeq: first.emitSeq, limit: 10 });
+    expect(retry.days[0]?.ledger).toEqual(["day/att/a", "day/att/b"]);
+    archive.settleAttachments(chat.id, "2026-03-10", [], retry.emitSeq);
+    archive.drain({ committedSeq: retry.emitSeq, limit: 10 });
+    archive.markAllDirty();
+    expect(archive.drain({ committedSeq: 0, limit: 10 }).days).toEqual([]);
+  });
+
+  it("purges an excluded chat's messages and dirties every day they touched", () => {
+    live(chat, stored(chat, 1, T0, "One"));
+    live(chat, stored(chat, 2, T0 + 86_400, "Two"));
+    drainAll();
+    expect(archive.applyExclusions(() => false)).toEqual({ purged: 1, restored: 0 });
+    const { days } = archive.drain({ committedSeq: 0, limit: 10 });
+    expect(days.map((d) => [d.date, d.messages.length])).toEqual([
+      ["2026-03-11", 0],
+      ["2026-03-10", 0],
+    ]);
+    expect(archive.getChat(chat.id)?.walkState).toBe("excluded");
+    // Live messages of an excluded chat are not kept.
+    expect(live(chat, stored(chat, 3, T0, "Three"))).toBe(false);
+    expect(archive.applyExclusions(() => true)).toEqual({ purged: 0, restored: 1 });
+    expect(archive.getChat(chat.id)).toMatchObject({ walkState: "pending", newestSeenId: 0 });
+  });
+
+  it("adds the second schema's columns to an archive the first one created", () => {
+    archive.close();
+    const path = join(dir, "old");
+    mkdirSync(path, { recursive: true });
+    const raw = new Database(join(path, "archive.db"));
+    raw.exec(
+      "CREATE TABLE users (user_id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, username TEXT, phone_e164 TEXT, is_bot INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+    );
+    raw.close();
+    archive = TelegramArchive.open(path, null, { now: () => clock });
+    archive.upsertUsers([HELPER_BOT]);
+    expect(archive.getUser(HELPER_BOT.id)).toMatchObject({ isBot: true, isDeleted: false });
   });
 });

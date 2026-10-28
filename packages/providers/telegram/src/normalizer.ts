@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Adrien Conrath
+
+/**
+ * One chat's UTC day → one conversation document (`docs/telegram-source.md` §8).
+ *
+ * The same shape as WhatsApp's day documents
+ * (`packages/providers/whatsapp/src/normalizer.ts`): a title, one markdown line
+ * per message, and the people who spoke. It renders from the archive, never
+ * from what one sync page happened to fetch, so a day re-rendered after an
+ * edit, a deletion or a late page is always the whole day.
+ *
+ * Times are UTC, like the day boundary, so a document reads the same on every
+ * host. The account holder is "You". Bots and deleted accounts are not people.
+ */
+
+import {
+  cleanPersonName,
+  computeContentHash,
+  extractEmailsFromText,
+  extractPhonesFromText,
+} from "@omnesis/core";
+import { servicePhrase } from "./message-extractor.js";
+import { telegramLinks } from "./links.js";
+import type {
+  DocumentInput,
+  PersonIdentifier,
+  PersonMention,
+  ProviderId,
+  SourceId,
+} from "@omnesis/types";
+import type { StoredUser } from "./message-store.js";
+import type { MediaDescriptor, StoredChat, StoredMessage } from "./types.js";
+
+/** The alias prefix the descriptor's `selfIdentity` declares. */
+const TELEGRAM_LID_PREFIX = "telegram-user";
+
+export interface DayRenderInput {
+  chat: StoredChat;
+  /** `YYYY-MM-DD`, UTC. */
+  date: string;
+  /** The day's surviving messages, oldest first; never empty. */
+  messages: readonly StoredMessage[];
+  /** Everyone the archive knows who appears in the day. */
+  users: ReadonlyMap<number, StoredUser>;
+  /** Messages the day replies to, by id, when the archive holds them. */
+  replies: ReadonlyMap<number, StoredMessage>;
+  self: { id: number; phoneE164?: string };
+  providerId: ProviderId;
+  sourceId: SourceId;
+  /** For phones found in message text, which may be written nationally. */
+  phoneRegion?: string;
+}
+
+type PhoneRegion = Parameters<typeof extractPhonesFromText>[1];
+
+const GROUPISH = new Set(["group", "supergroup", "forum"]);
+
+/** The day document's external id: the marked chat id and the UTC date. */
+export function dayExternalId(chatId: number, date: string): string {
+  return `${chatId}:${date}`;
+}
+
+function formatTime(ts: number): string {
+  return new Date(ts * 1000).toISOString().slice(11, 16);
+}
+
+function formatDuration(seconds: number | undefined): string | undefined {
+  if (seconds === undefined) return undefined;
+  const s = Math.max(0, Math.round(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** The placeholder a media message renders as; `undefined` for none. */
+export function mediaPlaceholder(media: MediaDescriptor): string | undefined {
+  const duration = formatDuration(media.durationSec);
+  switch (media.kind) {
+    case "photo":
+      return "[Photo]";
+    case "document":
+      return media.fileName ? `[Document: ${media.fileName}]` : "[Document]";
+    case "voice":
+      return duration ? `[Voice note, ${duration}]` : "[Voice note]";
+    case "audio":
+      return duration ? `[Audio, ${duration}]` : "[Audio]";
+    case "video":
+      return duration ? `[Video, ${duration}]` : "[Video]";
+    case "video_note":
+      return "[Video message]";
+    case "sticker":
+      return media.summary ? `[Sticker ${media.summary}]` : "[Sticker]";
+    case "animation":
+      return "[GIF]";
+    case "location":
+      return media.summary ? `[Location: ${media.summary}]` : "[Location]";
+    case "contact":
+      return "[Contact]";
+    case "poll":
+      return media.summary ? `[Poll: ${media.summary}]` : "[Poll]";
+    case "webpage":
+      // A link preview: the URL is already in the message text.
+      return undefined;
+    case "other":
+      return "[Media]";
+  }
+}
+
+export function normalizeDayChat(input: DayRenderInput): DocumentInput {
+  const { chat, date, messages, users, replies, self } = input;
+  const isGroup = GROUPISH.has(chat.kind);
+
+  const senderName = (m: Pick<StoredMessage, "outgoing" | "senderId" | "senderName">): string => {
+    if (m.outgoing || m.senderId === self.id) return "You";
+    const user = m.senderId !== undefined ? users.get(m.senderId) : undefined;
+    return user?.displayName ?? m.senderName ?? "Unknown";
+  };
+
+  const lines = [`# ${chat.title} — ${date}`, ""];
+  for (const m of messages) lines.push(renderMessage(m, senderName, replies));
+  const content = lines.join("\n");
+
+  // People: self first, the other side of a private chat, then whoever spoke.
+  const people: PersonMention[] = [
+    {
+      role: "participant",
+      name: "You",
+      identifiers: [
+        { kind: "lid", value: `${TELEGRAM_LID_PREFIX}:${self.id}` },
+        ...(self.phoneE164 ? [{ kind: "phone" as const, value: self.phoneE164 }] : []),
+      ],
+    },
+  ];
+  const participants = new Set<string>(["You"]);
+  const seen = new Set<number>([self.id]);
+  const phones = new Set<string>(self.phoneE164 ? [self.phoneE164] : []);
+  const addUser = (userId: number, fallbackName?: string): void => {
+    if (seen.has(userId)) return;
+    seen.add(userId);
+    const user = users.get(userId);
+    if (user?.isBot || user?.isDeleted) return;
+    // A channel or anonymous admin posts as the chat: not a person.
+    if (userId <= 0) return;
+    const name = cleanPersonName(user?.displayName ?? fallbackName);
+    const identifiers: PersonIdentifier[] = [
+      { kind: "lid", value: `${TELEGRAM_LID_PREFIX}:${userId}` },
+    ];
+    if (user?.phoneE164) {
+      identifiers.push({ kind: "phone", value: user.phoneE164 });
+      phones.add(user.phoneE164);
+    }
+    people.push({ role: "participant", ...(name ? { name } : {}), identifiers });
+    if (name) participants.add(name);
+  };
+  if (chat.kind === "private") addUser(chat.chatId, chat.title);
+  for (const m of messages) {
+    if (m.outgoing || m.senderId === undefined || m.service) continue;
+    addUser(m.senderId, m.senderName);
+  }
+
+  const emails = new Set<string>();
+  for (const email of extractEmailsFromText(content)) {
+    if (emails.has(email)) continue;
+    emails.add(email);
+    people.push({ role: "mentioned", identifiers: [{ kind: "email", value: email }] });
+  }
+  for (const phone of extractPhonesFromText(content, input.phoneRegion as PhoneRegion)) {
+    if (phones.has(phone)) continue;
+    phones.add(phone);
+    people.push({
+      role: "mentioned",
+      identifiers: [{ kind: "phone", value: phone }],
+      allowPersonCreation: false,
+    });
+  }
+
+  const first = messages[0];
+  const created = first.ts;
+  const updated = Math.max(...messages.map((m) => Math.max(m.ts, m.editTs ?? 0)));
+  const links = telegramLinks(chat, first);
+
+  return {
+    providerId: input.providerId,
+    sourceId: input.sourceId,
+    externalId: dayExternalId(chat.chatId, date),
+    title: `${chat.title} — ${date}`,
+    content,
+    contentHash: computeContentHash(content),
+    metadata: {
+      documentType: "conversation",
+      tags: isGroup ? ["group"] : [],
+      ...links,
+      people,
+      extra: {
+        chatId: String(chat.chatId),
+        conversationId: String(chat.chatId),
+        chatName: chat.title,
+        chatKind: chat.kind,
+        isGroup,
+        isArchived: chat.isArchived,
+        messageCount: messages.filter((m) => !m.service).length,
+        mediaCount: messages.filter((m) => m.media && m.media.kind !== "webpage").length,
+        participants: [...participants],
+        date,
+      },
+    },
+    sourceCreatedAt: new Date(created * 1000).toISOString(),
+    sourceUpdatedAt: new Date(updated * 1000).toISOString(),
+  };
+}
+
+function renderMessage(
+  m: StoredMessage,
+  senderName: (m: Pick<StoredMessage, "outgoing" | "senderId" | "senderName">) => string,
+  replies: ReadonlyMap<number, StoredMessage>,
+): string {
+  const time = `**${formatTime(m.ts)}**`;
+  const sender = senderName(m);
+  if (m.service) return `${time} _${sender} ${servicePhrase(m.service)}_`;
+
+  let quote = "";
+  const target = m.replyToId !== undefined ? replies.get(m.replyToId) : undefined;
+  if (target) {
+    const quoted = target.text.split("\n")[0] || (target.media && mediaPlaceholder(target.media));
+    if (quoted) quote = `> _${senderName(target)}: ${quoted}_\n`;
+  }
+
+  const parts: string[] = [];
+  if (m.forwardFrom) parts.push(`(forwarded from ${m.forwardFrom})`);
+  const placeholder = m.media ? mediaPlaceholder(m.media) : undefined;
+  if (placeholder) parts.push(placeholder);
+  if (m.text) parts.push(m.text);
+  const edited = m.editTs ? " (edited)" : "";
+  return `${quote}${time} ${sender}: ${parts.join(" ")}${edited}`;
+}

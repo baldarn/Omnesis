@@ -12,14 +12,21 @@
  * rewrites the credential without its key, stops the client, reports the
  * failure to the host, and makes every later sync an auth error until the
  * operator signs in again.
+ *
+ * Live updates are archived synchronously inside the update handler
+ * (`docs/telegram-source.md` §7.3), before mtcute saves its update state, and
+ * each change wakes the host for a sync. A gap the client reports, or an
+ * outage long enough to have lost updates, queues a reconcile for the walker.
  */
 
 import { createLogger, toErrorMessage } from "@omnesis/core";
 import { SyncError, type SyncRemediation } from "@omnesis/types";
 import { loadAppCredentials } from "./credentials-spec.js";
 import { telegramDeviceInfo } from "./device.js";
-import { CONNECT_TIMEOUT_MS } from "./limits.js";
-import { TelegramArchive } from "./message-store.js";
+import { CONNECT_TIMEOUT_MS, GAP_SUSPECT_OUTAGE_S } from "./limits.js";
+import { extractMessage } from "./message-extractor.js";
+import { isChatIncluded, type ChatPolicy } from "./history-walker.js";
+import { TelegramArchive, type StoredUser } from "./message-store.js";
 import { readTelegramStoreKey } from "./protected-store.js";
 import {
   markSessionRevoked,
@@ -72,7 +79,13 @@ export class TelegramProvider {
   private disposed = false;
   private suspended = false;
   private readonly errorHandlers = new Set<(error: string) => void>();
+  private readonly changeHandlers = new Set<() => void>();
   private readonly unsubscribeUpdates: () => void;
+  private chatPolicy: ChatPolicy = { includeChannels: false, excludedChats: [] };
+  /** Unix seconds; a live message older than this is not kept. */
+  private cutoffTs: number | undefined;
+  /** Unix seconds the connection was last seen dropping, while it is down. */
+  private offlineSince: number | undefined;
 
   private constructor(
     options: TelegramProviderOptions,
@@ -121,6 +134,9 @@ export class TelegramProvider {
         options.device ?? telegramDeviceInfo(),
       );
       const provider = new TelegramProvider(options, archive, adapter, record);
+      // Before the updates loop starts: its catch-up raises newest_seen_id,
+      // and the gap floors must sit below whatever the downtime lost.
+      provider.checkDowntime();
       provider.connecting = provider.connect();
       return provider;
     } catch (err) {
@@ -148,6 +164,33 @@ export class TelegramProvider {
     return this.archive;
   }
 
+  /** The live client, for the history walker. */
+  getAdapter(): TelegramAdapter {
+    return this.adapter;
+  }
+
+  /** The account's own user id. */
+  get selfId(): number {
+    return Number(this.accountId);
+  }
+
+  /** The account's own user as the archive keeps it, once connected. */
+  selfUser(): StoredUser | undefined {
+    return this.archive.getUser(this.selfId);
+  }
+
+  /** Which chats live updates may archive; the source sets it from its config. */
+  setChatPolicy(policy: ChatPolicy, cutoffTs?: number): void {
+    this.chatPolicy = policy;
+    this.cutoffTs = cutoffTs;
+  }
+
+  /** Called after every archive change a live update made, so the host syncs. */
+  onArchiveChange(handler: () => void): () => void {
+    this.changeHandlers.add(handler);
+    return () => this.changeHandlers.delete(handler);
+  }
+
   /**
    * Called at the top of every sync page: fail as auth when the session is
    * gone, as network when the client cannot connect, and otherwise confirm the
@@ -173,6 +216,11 @@ export class TelegramProvider {
       throw this.syncErrorFrom(err);
     }
     if (this.revokedReason) return this.failRevoked();
+    this.archive.setMeta("last_online_at", String(this.nowSeconds()));
+  }
+
+  private nowSeconds(): number {
+    return Math.floor(this.now().getTime() / 1000);
   }
 
   /** Fail as auth once the revocation is on disk, so the host reads the same state. */
@@ -244,6 +292,7 @@ export class TelegramProvider {
       }
       this.self = self;
       this.archive.upsertUsers([self]);
+      this.archive.setMeta("last_online_at", String(this.nowSeconds()));
       await this.refreshRecord(self);
       log.info(`Telegram account ${this.accountId} connected`);
       return { ok: true, self };
@@ -300,19 +349,84 @@ export class TelegramProvider {
           void this.revoke(update.reason);
           return;
         case "new":
-        case "edit":
-          // Archived by the history walk's update routing (phase 2); for now
-          // only the people are kept.
-          this.archive.upsertUsers(update.users);
+        case "edit": {
+          const { chat, message, users } = update;
+          const changed = this.archive.storeLive(
+            chat,
+            users,
+            this.cutoffTs !== undefined && message.date < this.cutoffTs
+              ? null
+              : extractMessage(message),
+            { id: message.id, date: message.date },
+            isChatIncluded(chat, this.chatPolicy),
+          );
+          if (changed) this.notifyChange();
           return;
+        }
         case "delete":
+          if (this.archive.deleteMessages(update.box, update.ids) > 0) this.notifyChange();
+          return;
         case "gap":
+          if (update.scope === "account") this.archive.requestAccountReconcile();
+          else this.archive.requestChannelReconcile(update.scope.channelId);
+          log.info(
+            `Telegram reported an update gap (${update.scope === "account" ? "account" : "channel"}); reconciling`,
+          );
+          this.notifyChange();
+          return;
         case "connection":
+          this.onConnectionState(update.state);
           return;
       }
     } catch (err) {
       // An update handler that throws would restart mtcute's updates loop.
       log.error(`Telegram update handling failed: ${toErrorMessage(err)}`);
+    }
+  }
+
+  private notifyChange(): void {
+    for (const handler of this.changeHandlers) {
+      try {
+        handler();
+      } catch (err) {
+        log.error(`Telegram change handler failed: ${toErrorMessage(err)}`);
+      }
+    }
+  }
+
+  /** An outage long enough to have lost updates asks for an account reconcile. */
+  private onConnectionState(state: "offline" | "connecting" | "updating" | "connected"): void {
+    // The states of the first connect are covered by checkDowntime().
+    if (!this.self) return;
+    const now = this.nowSeconds();
+    if (state !== "connected") {
+      if (this.offlineSince === undefined) {
+        this.offlineSince = now;
+        // Where every chat stood as the connection dropped: catch-up after
+        // the reconnect raises newest_seen_id before "connected" arrives.
+        this.archive.markOutageFloors();
+      }
+      return;
+    }
+    const since = this.offlineSince;
+    this.offlineSince = undefined;
+    this.archive.setMeta("last_online_at", String(now));
+    if (since !== undefined && now - since > GAP_SUSPECT_OUTAGE_S) {
+      log.info(`Telegram was offline for ${now - since}s; reconciling`);
+      this.archive.requestAccountReconcile();
+      this.notifyChange();
+    } else {
+      this.archive.clearOutageFloors();
+    }
+  }
+
+  /** The same for the time this process was not running at all. */
+  private checkDowntime(): void {
+    const last = Number(this.archive.getMeta("last_online_at") ?? "NaN");
+    const now = this.nowSeconds();
+    if (Number.isFinite(last) && now - last > GAP_SUSPECT_OUTAGE_S) {
+      log.info(`Telegram was last online ${now - last}s ago; reconciling`);
+      this.archive.requestAccountReconcile();
     }
   }
 
@@ -352,8 +466,10 @@ export class TelegramProvider {
         case "revoked":
           return this.revokedError();
         case "flood-wait":
+          // Telegram counts flood waits against the signed-in account.
           return new SyncError("rate-limit", err.message, {
             retryAfterMs: (err.detail?.seconds ?? 0) * 1000,
+            quota: { kind: "account", id: this.accountId },
             cause: err,
           });
         case "network":

@@ -152,7 +152,7 @@ describe("the Telegram provider lifecycle", () => {
     await expect(definition.discover!({ configDir })).resolves.toHaveLength(1);
   });
 
-  it("returns an empty page once connected, acknowledging only its own archive", async () => {
+  it("syncs an account with no chats to one settled, empty page of its own archive", async () => {
     await seed(SELF);
     const ctx = await context(String(SELF.id));
     const source = await instance(String(SELF.id), ctx);
@@ -161,12 +161,10 @@ describe("the Telegram provider lifecycle", () => {
       documents: [],
       deletedExternalIds: [],
       hasMore: false,
-      cursor: { phase: "bootstrap", committedSeq: 0, storeId: ctx.storeId },
+      cursor: { phase: "incremental", storeId: ctx.storeId },
+      progress: { coverage: "complete", coverageSubject: "history" },
     });
-    const same = await source.sync({ phase: "incremental", committedSeq: 7, storeId: ctx.storeId });
-    expect(same.cursor).toMatchObject({ committedSeq: 7 });
-    const foreign = await source.sync({ phase: "incremental", committedSeq: 7, storeId: "other" });
-    expect(foreign.cursor).toMatchObject({ committedSeq: 0, storeId: ctx.storeId });
+    expect(sim.calls.map((c) => c.method)).toContain("iterDialogs");
     await expect(
       source.probeLocalStores!({ signal: new AbortController().signal }),
     ).resolves.toEqual([
