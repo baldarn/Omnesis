@@ -14,8 +14,17 @@
       "username": "maya_reeves_example",
       "phone": "15550100122"
     },
-    { "id": 5550100203, "firstName": "Jamie", "lastName": "Lopez", "phone": "15550100123" },
-    { "id": 5550100204, "firstName": "David", "lastName": "Lin" }
+    {
+      "id": 5550100203,
+      "firstName": "Jamie",
+      "lastName": "Lopez",
+      "phone": "15550100123"
+    },
+    {
+      "id": 5550100204,
+      "firstName": "David",
+      "lastName": "Lin"
+    }
   ],
   "chats": [
     {
@@ -41,7 +50,11 @@
           "at": "2026-03-10T09:12:00Z",
           "from": 5550100202,
           "text": "Draft attached for the marathon entry form",
-          "media": { "kind": "document", "fileName": "entry-form.pdf", "isViewOnce": false }
+          "media": {
+            "kind": "document",
+            "fileName": "entry-form.pdf",
+            "isViewOnce": false
+          }
         },
         {
           "id": 106,
@@ -123,6 +136,37 @@
           "at": "2026-03-12T20:00:00Z",
           "from": 5550100201,
           "text": "Reminder: renew the kayak club membership."
+        }
+      ]
+    },
+    {
+      "id": -1001500000003,
+      "kind": "forum",
+      "title": "Kayak club forum",
+      "topics": [
+        {
+          "id": 10,
+          "title": "Equipment"
+        },
+        {
+          "id": 20,
+          "title": "Trips"
+        }
+      ],
+      "messages": [
+        {
+          "id": 11,
+          "at": "2026-03-13T07:00:00Z",
+          "from": 5550100203,
+          "topic": 10,
+          "text": "The spare paddles are in the blue locker."
+        },
+        {
+          "id": 21,
+          "at": "2026-03-13T07:30:00Z",
+          "from": 5550100204,
+          "topic": 20,
+          "text": "Estuary trip is planned for the first calm weekend."
         }
       ]
     },

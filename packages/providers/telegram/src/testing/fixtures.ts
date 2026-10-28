@@ -262,6 +262,7 @@ export async function syncRig(
       providerId: ProviderId(`telegram:${SELF.id}`),
       policy: { includeChannels: false, excludedChats: [] },
       clock: instantClock,
+      takeout: false,
       ...options,
       ...extra,
     });

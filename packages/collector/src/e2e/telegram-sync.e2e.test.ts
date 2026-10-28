@@ -12,7 +12,9 @@
  * spawned gateway:
  *   - the bootstrap walk lands one document per chat per UTC day, archived
  *     chats and Saved Messages included, the opt-in channel left out, and the
- *     day documents are searchable;
+ *     day documents are searchable; it reads history through a data export
+ *     (takeout) session, which it finishes once the walk is done;
+ *   - a forum day renders each message with its topic and names the topics;
  *   - a live edit and a live deletion through the simulated server are
  *     reflected in the stored day document;
  *   - a voice note is transcribed into its day (the gateway runs the replay
@@ -23,6 +25,11 @@
  *   - a day whose every message is deleted disappears from the gateway;
  *   - the account's own messages resolve to the cast's self person through
  *     the descriptor's `selfIdentity` alias.
+ *
+ * Switching channels on and off is a config change, which rebuilds the
+ * source; the harness has no source manager to do that, so the toggle (with
+ * a channel attachment) is covered over the same real source in
+ * `packages/providers/telegram/src/messages.test.ts`.
  *
  * The controller is reached through a dynamic import: a static one would load
  * the synth package, and cache the active universe, before the harness sets
@@ -44,6 +51,7 @@ const CLUB_DAY = "-1001500000001:2026-03-10";
 const CREW_DAY = "-4001500001:2026-03-12";
 const SAVED_DAY = `${SELF_ID}:2026-03-12`;
 const CHANNEL_DAY = "-1001500000002:2026-03-12";
+const FORUM_DAY = "-1001500000003:2026-03-13";
 
 interface DocRow {
   id: string;
@@ -139,7 +147,7 @@ describe("Telegram wraps-real: day documents, live edits and deletions, self ide
       .map((r) => r.external_id)
       .filter((id) => !id.includes("/att/"))
       .sort();
-    expect(ids).toEqual([CLUB_DAY, CREW_DAY, MAYA_DAY_1, MAYA_DAY_2, SAVED_DAY].sort());
+    expect(ids).toEqual([CLUB_DAY, CREW_DAY, FORUM_DAY, MAYA_DAY_1, MAYA_DAY_2, SAVED_DAY].sort());
     expect(doc(CHANNEL_DAY)).toBeUndefined();
 
     const maya = doc(MAYA_DAY_1)!;
@@ -150,6 +158,28 @@ describe("Telegram wraps-real: day documents, live edits and deletions, self ide
     expect(club.content).toContain("> _Jamie Lopez: Long run on Saturday");
     expect(JSON.parse(doc(CREW_DAY)!.metadata)).toMatchObject({
       extra: { chatKind: "group", isArchived: true, isGroup: true },
+    });
+  });
+
+  test("the bootstrap walk read history through a data export it then finished", async () => {
+    const ctrl = await controller();
+    expect(ctrl.server.takeoutScopes).toEqual([
+      { messageUsers: true, messageChats: true, messageMegagroups: true, messageChannels: false },
+    ]);
+    const methods = ctrl.server.calls.map((c) => c.method);
+    expect(methods).toContain("takeoutGetHistory");
+    expect(methods.filter((m) => m === "finishTakeout")).toHaveLength(1);
+    expect(ctrl.provider.getArchive().takeoutState().state).toBe("done");
+  });
+
+  test("a forum day renders each message with its topic", () => {
+    const forum = doc(FORUM_DAY)!;
+    expect(forum.content).toContain(
+      "**07:00** [#Equipment] Jamie Lopez: The spare paddles are in the blue locker.",
+    );
+    expect(forum.content).toContain("**07:30** [#Trips] David Lin: Estuary trip is planned");
+    expect(JSON.parse(forum.metadata)).toMatchObject({
+      extra: { chatKind: "forum", isGroup: true, topics: ["Equipment", "Trips"] },
     });
   });
 

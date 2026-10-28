@@ -30,6 +30,9 @@ import type { DocumentInput } from "@omnesis/types";
 const profile = telegram.sources[0]!.documentEventProfile!;
 const GROUP = chatOf(-1006000000006, "supergroup", "Studio Northstar crew");
 const JAMIE_CHAT = privateChatWith(JAMIE);
+const FORUM = chatOf(-1006000000007, "forum", "Riverside Estate planning");
+/** Fields only some chat shapes carry. */
+const FORUM_ONLY = new Set(["extra.topics"]);
 
 function readPath(doc: DocumentInput, path: string): unknown {
   return path
@@ -89,6 +92,16 @@ describe("telegram documentEventProfile", () => {
               }),
             ],
           },
+          {
+            chat: FORUM,
+            topics: [{ id: 10, title: "Catering" }],
+            messages: [
+              messageIn(FORUM, 11, T0, "Menu tasting moved to Thursday", {
+                senderId: DAVID.id,
+                topicId: 10,
+              }),
+            ],
+          },
         ],
       },
       {
@@ -108,6 +121,7 @@ describe("telegram documentEventProfile", () => {
 
   const group = (): DocumentInput => docs.get(`${GROUP.id}:2026-03-10`)!;
   const oneToOne = (): DocumentInput => docs.get(`${JAMIE.id}:2026-03-10`)!;
+  const forum = (): DocumentInput => docs.get(`${FORUM.id}:2026-03-10`)!;
   const attachment = (): DocumentInput =>
     [...docs.values()].find((d) => d.metadata.documentType === "attachment")!;
 
@@ -124,10 +138,17 @@ describe("telegram documentEventProfile", () => {
     expect(new Set(profile.personRoles)).toEqual(roles);
   });
 
-  it("every declared field is present and typed on both chat shapes", () => {
-    for (const doc of [group(), oneToOne()]) {
+  it("every declared field is present and typed on every chat shape that carries it", () => {
+    for (const doc of [group(), oneToOne(), forum()]) {
       for (const field of profile.metadataFields ?? []) {
         const value = readPath(doc, field.path);
+        if (FORUM_ONLY.has(field.path) && doc !== forum()) {
+          expect(
+            value,
+            `${field.path} on a ${String(doc.metadata.extra?.chatKind)}`,
+          ).toBeUndefined();
+          continue;
+        }
         expect(value, `${field.path} is missing`).toBeDefined();
         expect(matchesType(value, field.type), `${field.path} is not a ${field.type}`).toBe(true);
         if (field.allowedValues && typeof value === "string") {
@@ -154,6 +175,11 @@ describe("telegram documentEventProfile", () => {
     // Mentions are scoped to the file; participants come from the day.
     const roles = new Set((attachment().metadata.people ?? []).map((p) => p.role));
     expect([...roles].every((r) => profile.personRoles?.includes(r))).toBe(true);
+  });
+
+  it("names a forum day's topics", () => {
+    expect(readPath(forum(), "extra.topics")).toEqual(["Catering"]);
+    expect(forum().content).toContain("[#Catering] David Lin: Menu tasting moved to Thursday");
   });
 
   it("counts messages and media", () => {

@@ -49,7 +49,7 @@ const log = createLogger("source:telegram-messages").child("store");
 const ARCHIVE_FILE = "archive.db";
 const ARCHIVE_LABEL = "Telegram message archive";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS chats (
   last_message_ts INTEGER NOT NULL DEFAULT 0,
   reconcile_offset_id INTEGER,
   presence_after_id INTEGER,
-  outage_floor_id INTEGER
+  outage_floor_id INTEGER,
+  topics_listed_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -157,6 +158,7 @@ const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]
   ["messages", "extract_rev", "INTEGER NOT NULL DEFAULT 0"],
   ["emitted_attachments", "retired_seq", "INTEGER"],
   ["messages", "media_extract_json", "TEXT"],
+  ["chats", "topics_listed_at", "INTEGER"],
 ];
 
 /** The media kinds a message is enrolled in the media lifecycle for (`media-retry.ts`). */
@@ -216,6 +218,8 @@ export interface ChatProgress extends StoredChat {
   lastPresenceCheckAt?: number;
   presenceAfterId?: number;
   lastMessageTs: number;
+  /** Unix seconds a forum's topics were last listed; absent: never, or due again. */
+  topicsListedAt?: number;
 }
 
 /** One history page, ready to commit with the checkpoint it advances. */
@@ -245,6 +249,8 @@ export interface DrainResult {
   morePending: boolean;
 }
 
+export type TakeoutState = "active" | "delayed" | "done" | "unavailable";
+
 /** Counts the sync reports progress and `hasMore` from. */
 export interface WalkSummary {
   pending: number;
@@ -270,6 +276,7 @@ interface ChatRow {
   last_presence_check_at: number | null;
   presence_after_id: number | null;
   last_message_ts: number;
+  topics_listed_at: number | null;
 }
 
 interface MessageRow {
@@ -474,6 +481,7 @@ export class TelegramArchive {
          top_at_enumeration = excluded.top_at_enumeration,
          last_message_ts = MAX(chats.last_message_ts, excluded.last_message_ts),
          walk_state = CASE WHEN chats.walk_state = 'failed' THEN 'pending' ELSE chats.walk_state END,
+         topics_listed_at = NULL,
          updated_at = excluded.updated_at`,
     );
     const markForward = this.db.prepare(
@@ -576,9 +584,11 @@ export class TelegramArchive {
        ON CONFLICT(chat_id, date) DO UPDATE SET emit_seq = NULL`,
     );
     const purge = this.db.prepare("DELETE FROM messages WHERE chat_id = ?");
+    const purgeTopics = this.db.prepare("DELETE FROM topics WHERE chat_id = ?");
     const exclude = this.db.prepare(
       `UPDATE chats SET walk_state = 'excluded', oldest_fetched_id = NULL, newest_seen_id = 0,
-         reconcile_from_id = NULL, reconcile_offset_id = NULL, presence_after_id = NULL
+         reconcile_from_id = NULL, reconcile_offset_id = NULL, presence_after_id = NULL,
+         topics_listed_at = NULL
        WHERE chat_id = ?`,
     );
     const restore = this.db.prepare(
@@ -594,6 +604,7 @@ export class TelegramArchive {
           markDays.run(chat.chatId);
           markLedgerDays.run(chat.chatId);
           purge.run(chat.chatId);
+          purgeTopics.run(chat.chatId);
           exclude.run(chat.chatId);
           purged++;
         } else if (included && chat.walkState === "excluded") {
@@ -804,6 +815,7 @@ export class TelegramArchive {
       .prepare("SELECT media_json FROM messages WHERE chat_id = ? AND msg_id = ?")
       .get(m.chatId, m.msgId) as { media_json: string | null } | undefined;
     let deletedAt: number | null = null;
+    if (!exists && this.collides(m)) return false;
     if (!exists) {
       const pending = this.db
         .prepare("SELECT observed_at FROM pending_deletions WHERE box = ? AND msg_id = ?")
@@ -868,6 +880,31 @@ export class TelegramArchive {
     if (deleted.deleted === 1) return false;
     this.markDirty(m.chatId, messageDate(m.ts));
     return true;
+  }
+
+  /**
+   * Whether another chat already holds this message's id in its box. Ids in
+   * the common box are account-wide, so Telegram never repeats one; if it
+   * ever did (or a client reported a message under the wrong chat), the
+   * deletion index would refuse the row and fail the whole page, on every
+   * sync, for good. The archived message stays; the newcomer is skipped and
+   * counted, and the page moves on.
+   */
+  private collides(m: StoredMessage): boolean {
+    const holder = this.db
+      .prepare("SELECT chat_id FROM messages WHERE box = ? AND msg_id = ? AND chat_id != ?")
+      .get(m.box, m.msgId, m.chatId) as { chat_id: number } | undefined;
+    if (!holder) return false;
+    log.warn(
+      `Telegram message ${m.msgId} in ${m.chatId} reuses an id ${holder.chat_id} holds in its box; skipped`,
+    );
+    this.setMeta("id_collisions", String((this.metaNumber("id_collisions") ?? 0) + 1));
+    return true;
+  }
+
+  /** Messages skipped because another chat held their id (see `collides`). */
+  idCollisionCount(): number {
+    return this.metaNumber("id_collisions") ?? 0;
   }
 
   private markDirty(chatId: number, date: string): void {
@@ -1018,6 +1055,111 @@ export class TelegramArchive {
       excluded: counts.excluded ?? 0,
       reconcilePending: !!reconcile || this.getMeta("reconcile_requested") === "1",
     };
+  }
+
+  // ── Forum topics ──────────────────────────────────────────────────────
+
+  /**
+   * Forum chats whose topics should be listed: never listed since the last
+   * dialog listing, or holding a message newer than the listing in a topic
+   * the archive has no title for (a topic created since).
+   */
+  forumsDueForTopics(): number[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT chat_id FROM chats c
+           WHERE is_forum = 1 AND walk_state NOT IN ('excluded', 'failed')
+             AND (topics_listed_at IS NULL OR EXISTS (
+               SELECT 1 FROM messages m
+               WHERE m.chat_id = c.chat_id AND m.topic_id IS NOT NULL AND m.deleted = 0
+                 AND m.ts >= c.topics_listed_at
+                 AND NOT EXISTS (SELECT 1 FROM topics t
+                                 WHERE t.chat_id = m.chat_id AND t.topic_id = m.topic_id)))
+           ORDER BY last_message_ts DESC, chat_id ASC`,
+        )
+        .all() as { chat_id: number }[]
+    ).map((r) => r.chat_id);
+  }
+
+  /**
+   * Record a forum's topics. Only the days holding a message in a topic whose
+   * title is new or changed are marked dirty, so listing an unchanged forum
+   * again re-renders nothing.
+   */
+  recordTopics(chatId: number, topics: readonly { id: number; title: string }[]): number {
+    let changed = 0;
+    const current = this.getTopics(chatId);
+    const upsert = this.db.prepare(
+      `INSERT INTO topics (chat_id, topic_id, title) VALUES (?, ?, ?)
+       ON CONFLICT(chat_id, topic_id) DO UPDATE SET title = excluded.title`,
+    );
+    const markDays = this.db.prepare(
+      `INSERT INTO dirty_days (chat_id, date, emit_seq)
+       SELECT DISTINCT chat_id, date(ts, 'unixepoch'), NULL FROM messages
+       WHERE chat_id = ? AND topic_id = ? AND deleted = 0
+       ON CONFLICT(chat_id, date) DO UPDATE SET emit_seq = NULL`,
+    );
+    this.db.transaction(() => {
+      for (const topic of topics) {
+        if (current.get(topic.id) === topic.title) continue;
+        upsert.run(chatId, topic.id, topic.title);
+        changed += markDays.run(chatId, topic.id).changes > 0 ? 1 : 0;
+      }
+      this.db
+        .prepare("UPDATE chats SET topics_listed_at = ? WHERE chat_id = ?")
+        .run(this.now(), chatId);
+    })();
+    return changed;
+  }
+
+  /** A forum's topic titles by topic id. */
+  getTopics(chatId: number): Map<number, string> {
+    return new Map(
+      (
+        this.db.prepare("SELECT topic_id, title FROM topics WHERE chat_id = ?").all(chatId) as {
+          topic_id: number;
+          title: string;
+        }[]
+      ).map((r) => [r.topic_id, r.title]),
+    );
+  }
+
+  // ── Takeout (`docs/telegram-source.md` §7.2, phase 4) ──────────────────
+
+  /**
+   * Where the bootstrap's data export stands. `delayed`: Telegram holds it
+   * until the owner approves it, retried at `retryAt`; `done`: the walk it
+   * served finished; `unavailable`: refused or lost, the walk reads history
+   * the normal way. Absent: not tried yet.
+   */
+  takeoutState(): { state?: TakeoutState; retryAt?: number } {
+    const state = this.getMeta("takeout_state") as TakeoutState | undefined;
+    const retryAt = this.metaNumber("takeout_retry_at");
+    return {
+      ...(state ? { state } : {}),
+      ...(retryAt !== undefined ? { retryAt } : {}),
+    };
+  }
+
+  setTakeoutState(state: TakeoutState, retryAfterS?: number): void {
+    this.db.transaction(() => {
+      this.setMeta("takeout_state", state);
+      if (retryAfterS !== undefined) {
+        this.setMeta("takeout_retry_at", String(this.now() + retryAfterS));
+      } else {
+        this.deleteMeta("takeout_retry_at");
+      }
+    })();
+  }
+
+  /** A resync: a held-back export is asked for again on the next walk. */
+  clearTakeoutDelay(): void {
+    if (this.getMeta("takeout_state") !== "delayed") return;
+    this.db.transaction(() => {
+      this.deleteMeta("takeout_state");
+      this.deleteMeta("takeout_retry_at");
+    })();
   }
 
   // ── Publishing ────────────────────────────────────────────────────────
@@ -1386,6 +1528,7 @@ function toChatProgress(row: ChatRow): ChatProgress {
       : {}),
     ...(row.presence_after_id !== null ? { presenceAfterId: row.presence_after_id } : {}),
     lastMessageTs: row.last_message_ts,
+    ...(row.topics_listed_at !== null ? { topicsListedAt: row.topics_listed_at } : {}),
   };
 }
 

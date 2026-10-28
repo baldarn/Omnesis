@@ -12,11 +12,18 @@
  *    than `FULL_RECONCILE_INTERVAL_H`, or asked for by an account-wide gap.
  *    It records every chat (archived ones included), and queues a forward
  *    re-page for any chat whose top message is past what the archive holds.
+ *    Each forum's topics are listed after it, and again when a message
+ *    arrives in a topic the archive has no title for.
  * 2. **Forward re-pages** — ids above a chat's gap floor, newest first, until
  *    the floor is reached. This is what recovers messages lost in a gap,
  *    because mtcute does not report `differenceTooLong` at all.
  * 3. **The backward walk** — each chat not yet walked, most recently active
  *    first, newest page to oldest, until a short page or the data cutoff.
+ *    With a takeout policy it reads through a Telegram data export session
+ *    (`account.initTakeoutSession`, files excluded), which Telegram limits
+ *    less tightly than interactive reads; while Telegram holds the export
+ *    back for the owner's approval, or when it refuses one, the walk reads
+ *    the normal way. The export is finished when the walk is.
  * 4. **Presence checks** — after a gap, the recent ids of each chat involved
  *    are asked for again: one Telegram no longer returns was deleted, and a
  *    newer edit date is an edit the gap swallowed.
@@ -46,7 +53,9 @@ import {
 } from "./limits.js";
 import {
   TelegramError,
+  type TakeoutScope,
   type TelegramAdapter,
+  type TelegramTakeout,
   type TgChat,
   type TgDialog,
   type TgMessage,
@@ -124,6 +133,15 @@ export interface WalkOutcome {
   requests: number;
 }
 
+/**
+ * Where the open takeout session is kept: on the account's context, so a
+ * source rebuilt by a config change reuses it instead of asking Telegram for
+ * another export.
+ */
+export interface TakeoutHolder {
+  takeout: TelegramTakeout | undefined;
+}
+
 export interface HistoryWalkerDeps {
   adapter: TelegramAdapter;
   archive: TelegramArchive;
@@ -132,6 +150,33 @@ export interface HistoryWalkerDeps {
   cutoffTs?: number;
   clock?: WalkerClock;
   limits?: Partial<WalkLimits>;
+  /** Walk the bootstrap through a takeout session kept here; absent: never ask for one. */
+  takeout?: TakeoutHolder;
+}
+
+/** The export scope a policy asks for: every chat kind it archives. */
+function takeoutScopeOf(policy: ChatPolicy): TakeoutScope {
+  return {
+    messageUsers: true,
+    messageChats: true,
+    messageMegagroups: true,
+    messageChannels: policy.includeChannels,
+  };
+}
+
+function inScope(chat: Pick<StoredChat, "kind">, scope: TakeoutScope): boolean {
+  switch (chat.kind) {
+    case "private":
+    case "saved":
+      return scope.messageUsers;
+    case "group":
+      return scope.messageChats;
+    case "supergroup":
+    case "forum":
+      return scope.messageMegagroups;
+    case "channel":
+      return scope.messageChannels;
+  }
 }
 
 class Stop extends Error {
@@ -143,6 +188,12 @@ class Stop extends Error {
 /** A chat Telegram refused; the run moves on to the next one. */
 class ChatRefused extends Error {}
 
+/** The takeout session in use ended; the walk carries on without one. */
+class TakeoutLost extends Error {}
+
+/** What reads a backward page: the takeout session, or the plain client. */
+type HistoryReader = Pick<TelegramTakeout, "getHistory">;
+
 export class HistoryWalker {
   private readonly adapter: TelegramAdapter;
   private readonly archive: TelegramArchive;
@@ -150,9 +201,11 @@ export class HistoryWalker {
   private readonly limits: WalkLimits;
   private readonly policy: ChatPolicy;
   private readonly cutoffTs: number | undefined;
+  private readonly takeout: TakeoutHolder | undefined;
   private lastRequestAt = Number.NEGATIVE_INFINITY;
 
   constructor(deps: HistoryWalkerDeps) {
+    this.takeout = deps.takeout;
     this.adapter = deps.adapter;
     this.archive = deps.archive;
     this.clock = deps.clock ?? realClock;
@@ -167,6 +220,7 @@ export class HistoryWalker {
     if (this.archive.floodUntil() !== undefined) return { stop: "flood", requests: 0 };
     try {
       if (this.archive.enumerationDue(FULL_RECONCILE_INTERVAL_H * 3600)) await this.enumerate(ctx);
+      for (const chatId of this.archive.forumsDueForTopics()) await this.topics(ctx, chatId);
       for (const chat of this.included((c) => c.reconcileFromId !== undefined)) {
         await this.perChat(chat, () => this.forward(ctx, chat.chatId));
       }
@@ -183,9 +237,15 @@ export class HistoryWalker {
       )) {
         await this.perChat(chat, () => this.presence(ctx, chat));
       }
+      await this.finishTakeout();
       return { stop: "complete", requests: ctx.requests };
     } catch (err) {
       if (err instanceof Stop) return { stop: err.reason, requests: ctx.requests };
+      if (err instanceof TakeoutLost) {
+        // Only the backward walk reads through the export; anywhere else is a surprise.
+        log.warn(`Unexpected Telegram data export error: ${err.message}`);
+        return { stop: "network", requests: ctx.requests };
+      }
       throw err;
     }
   }
@@ -239,13 +299,22 @@ export class HistoryWalker {
     for (;;) {
       const chat = this.archive.getChat(chatId);
       if (!chat || (chat.walkState !== "pending" && chat.walkState !== "walking")) return;
-      const page = await this.request(ctx, () =>
-        this.adapter.getHistory(chatId, {
-          offsetId: chat.oldestFetchedId ?? 0,
-          limit: this.limits.pageSize,
-          signal: ctx.budget.signal,
-        }),
-      );
+      const reader = await this.historyReader(ctx, chat);
+      let page: { messages: TgMessage[]; users: TgUser[] };
+      try {
+        page = await this.request(ctx, () =>
+          reader.getHistory(chatId, {
+            offsetId: chat.oldestFetchedId ?? 0,
+            limit: this.limits.pageSize,
+            signal: ctx.budget.signal,
+          }),
+        );
+      } catch (err) {
+        if (!(err instanceof TakeoutLost)) throw err;
+        log.warn(`The Telegram data export ended (${err.message}); reading history the normal way`);
+        this.dropTakeout("unavailable");
+        continue;
+      }
       const write = this.pageWrite(page);
       const reachedCutoff =
         this.cutoffTs !== undefined && page.messages.some((m) => m.date < this.cutoffTs!);
@@ -274,6 +343,102 @@ export class HistoryWalker {
       if (page.messages.length > 0) {
         log.info(`Recovered ${page.messages.length} Telegram messages after a gap in ${chatId}`);
       }
+    }
+  }
+
+  /** List a forum's topics. A refusal is logged and not retried until the next listing. */
+  private async topics(ctx: RunContext, chatId: number): Promise<void> {
+    let topics: { id: number; title: string }[];
+    try {
+      topics = await this.request(ctx, async () => {
+        const out: { id: number; title: string }[] = [];
+        for await (const t of this.adapter.iterForumTopics(chatId, {
+          signal: ctx.budget.signal,
+        })) {
+          out.push(t);
+        }
+        return out;
+      });
+    } catch (err) {
+      if (!(err instanceof ChatRefused)) throw err;
+      log.warn(`Listing the topics of Telegram forum ${chatId} failed: ${err.message}`);
+      topics = [];
+    }
+    const changed = this.archive.recordTopics(chatId, topics);
+    log.info(`Listed ${topics.length} topics of Telegram forum ${chatId} (${changed} changed)`);
+  }
+
+  /**
+   * What reads the next backward page of `chat`: the takeout session when
+   * one is open or can be opened and covers the chat, else the plain client.
+   * Opening one is a request of the page's budget. Telegram holding the
+   * export back is recorded with the time to ask again; a refusal is
+   * recorded as unavailable, and neither stops the walk.
+   */
+  private async historyReader(ctx: RunContext, chat: ChatProgress): Promise<HistoryReader> {
+    const holder = this.takeout;
+    if (!holder) return this.adapter;
+    if (holder.takeout) return inScope(chat, holder.takeout.scope) ? holder.takeout : this.adapter;
+    const { state, retryAt } = this.archive.takeoutState();
+    if (state === "done" || state === "unavailable") return this.adapter;
+    if (state === "delayed" && retryAt !== undefined && retryAt * 1000 > this.clock.now()) {
+      return this.adapter;
+    }
+    const scope = takeoutScopeOf(this.policy);
+    const opened = await this.request(ctx, async () => {
+      try {
+        return await this.adapter.takeout(scope);
+      } catch (err) {
+        if (err instanceof TelegramError && err.code === "takeout") return err;
+        if (err instanceof TelegramError && TAKEOUT_REFUSALS.has(err.code)) return err;
+        throw err;
+      }
+    });
+    if (opened instanceof TelegramError) {
+      const seconds = opened.code === "takeout" ? opened.detail?.seconds : undefined;
+      if (seconds !== undefined && seconds > 0) {
+        this.archive.setTakeoutState("delayed", seconds);
+        log.info(
+          `Telegram holds the data export until it is approved (or ${seconds}s); walking without it`,
+        );
+      } else {
+        this.archive.setTakeoutState("unavailable");
+        log.warn(`Telegram refused a data export (${opened.message}); walking without it`);
+      }
+      return this.adapter;
+    }
+    holder.takeout = opened;
+    this.archive.setTakeoutState("active");
+    log.info("Walking Telegram history through a data export session");
+    return inScope(chat, opened.scope) ? opened : this.adapter;
+  }
+
+  /** Forget the takeout session in use, recording why. */
+  private dropTakeout(state: "done" | "unavailable"): void {
+    if (this.takeout) this.takeout.takeout = undefined;
+    this.archive.setTakeoutState(state);
+  }
+
+  /**
+   * Once nothing is left to walk, end the export session and never ask for
+   * another: a chat found later is walked the normal way, without notifying
+   * the owner's devices of a new export. An export still held back when the
+   * walk finished without it is settled the same way.
+   */
+  private async finishTakeout(): Promise<void> {
+    if (!this.takeout) return;
+    const { pending, walking } = this.archive.walkSummary();
+    if (pending + walking > 0) return;
+    const session = this.takeout.takeout;
+    const { state } = this.archive.takeoutState();
+    if (!session && state !== "delayed" && state !== "active") return;
+    this.dropTakeout("done");
+    if (!session) return;
+    try {
+      await session.finish(true);
+      log.info("Finished the Telegram data export");
+    } catch (err) {
+      log.warn(`Finishing the Telegram data export failed: ${toErrorMessage(err)}`);
     }
   }
 
@@ -377,6 +542,8 @@ export class HistoryWalker {
           throw new Stop("network");
         case "cancelled":
           throw new Stop("aborted");
+        case "takeout":
+          throw new TakeoutLost(err.message);
         case "forbidden":
         case "not-found":
         case "unknown":
@@ -386,6 +553,13 @@ export class HistoryWalker {
     }
   }
 }
+
+/** An export Telegram refuses outright: the walk goes on without one. */
+const TAKEOUT_REFUSALS: ReadonlySet<TelegramError["code"]> = new Set([
+  "forbidden",
+  "not-found",
+  "unknown",
+]);
 
 interface RunContext {
   requests: number;

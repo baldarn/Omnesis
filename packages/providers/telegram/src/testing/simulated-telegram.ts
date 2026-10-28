@@ -36,7 +36,9 @@ import {
   type DeviceInfo,
   type MessageBox,
   type RevocationReason,
+  type TakeoutScope,
   type TelegramAdapter,
+  type TelegramTakeout,
   type TelegramAuthAdapter,
   type TgChat,
   type TgDialog,
@@ -58,7 +60,14 @@ export const SIMULATED_QR_TTL_MS = 30_000;
 export interface SimulatedCorpus {
   self: TgUser;
   users?: TgUser[];
-  chats?: Array<{ chat: TgChat; messages: TgMessage[] }>;
+  chats?: SimulatedChat[];
+}
+
+export interface SimulatedChat {
+  chat: TgChat;
+  messages: TgMessage[];
+  /** A forum's topics; a message names its topic with `topicId`. */
+  topics?: Array<{ id: number; title: string }>;
 }
 
 export interface SimulatedCall {
@@ -77,6 +86,8 @@ export interface NewMessageInput {
   /** Unix seconds; defaults to now. */
   date?: number;
   replyToId?: number;
+  /** The forum topic the message is posted in. */
+  topicId?: number;
   media?: TgMediaRef;
   ttlPeriod?: number;
   service?: string;
@@ -105,6 +116,11 @@ export class SimulatedTelegram {
   private droppedUpdates = 0;
   private readonly media = new Map<string, Uint8Array | "expired" | "gone">();
   private referenceGeneration = 0;
+  private takeoutGeneration = 0;
+  /** @internal The takeout session generation still valid; older ones answer `TAKEOUT_INVALID`. */
+  validTakeout = 0;
+  /** The scope of every takeout session opened, in order. */
+  readonly takeoutScopes: TakeoutScope[] = [];
 
   constructor(corpus: SimulatedCorpus) {
     this.addAccount(corpus);
@@ -219,6 +235,38 @@ export class SimulatedTelegram {
     );
   }
 
+  /**
+   * Hold the next data export back, as Telegram does until the owner approves
+   * it on another device (`TAKEOUT_INIT_DELAY_%d`).
+   */
+  delayTakeout(seconds: number): void {
+    this.failNext(
+      "initTakeout",
+      new TelegramError("takeout", `TAKEOUT_INIT_DELAY_${seconds}`, {
+        seconds,
+        rpc: "TAKEOUT_INIT_DELAY_%d",
+      }),
+    );
+  }
+
+  /** End every open takeout session server-side; its next read answers `TAKEOUT_INVALID`. */
+  endTakeouts(): void {
+    this.validTakeout = Number.POSITIVE_INFINITY;
+  }
+
+  /** @internal Open a takeout session, returning its generation. */
+  openTakeout(scope: TakeoutScope): number {
+    this.takeoutScopes.push(scope);
+    this.validTakeout = ++this.takeoutGeneration;
+    return this.validTakeout;
+  }
+
+  /** Add a forum topic, or rename one. */
+  setTopic(chatId: number, id: number, title: string, ownerId?: number): void {
+    const entry = this.chatEntry(this.ownerAccount(ownerId), chatId);
+    entry.topics = [...(entry.topics ?? []).filter((t) => t.id !== id), { id, title }];
+  }
+
   /** Deliver an update to every live adapter, unless it is one `dropUpdates` loses. */
   emit(update: TgUpdate): void {
     if (this.droppedUpdates > 0 && update.kind !== "connection" && update.kind !== "revoked") {
@@ -277,6 +325,7 @@ export class SimulatedTelegram {
       outgoing,
       text: input.text ?? "",
       ...(input.replyToId ? { replyToId: input.replyToId } : {}),
+      ...(input.topicId ? { topicId: input.topicId } : {}),
       ...(input.media ? { media: input.media } : {}),
       ...(input.ttlPeriod ? { ttlPeriod: input.ttlPeriod } : {}),
       ...(input.service ? { service: input.service } : {}),
@@ -382,10 +431,7 @@ export class SimulatedTelegram {
     return first;
   }
 
-  private chatEntry(
-    account: SimulatedCorpus,
-    chatId: number,
-  ): { chat: TgChat; messages: TgMessage[] } {
+  private chatEntry(account: SimulatedCorpus, chatId: number): SimulatedChat {
     const entry = account.chats?.find((c) => c.chat.id === chatId);
     if (!entry) throw new Error(`No simulated chat ${chatId}`);
     return entry;
@@ -575,19 +621,68 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
     chatId: number,
     opts: { offsetId: number; limit: number; minId?: number },
   ): Promise<{ messages: TgMessage[]; users: TgUser[] }> {
-    return this.request(
-      "getHistory",
+    return this.request("getHistory", () => this.historyPage(chatId, opts), { chatId, ...opts });
+  }
+
+  private historyPage(
+    chatId: number,
+    opts: { offsetId: number; limit: number; minId?: number },
+  ): { messages: TgMessage[]; users: TgUser[] } {
+    const corpus = this.server.account(this.authorizeCurrent());
+    const chat = corpus.chats?.find((c) => c.chat.id === chatId);
+    const messages = (chat?.messages ?? [])
+      .filter((m) => (opts.offsetId === 0 || m.id < opts.offsetId) && m.id > (opts.minId ?? 0))
+      .sort((a, b) => b.id - a.id)
+      .slice(0, opts.limit);
+    return { messages, users: this.server.usersOf(corpus, messages, chat?.chat) };
+  }
+
+  /**
+   * A takeout session: `initTakeout`, then `takeoutGetHistory` and
+   * `finishTakeout` in `calls`. A chat outside the session's scope answers
+   * `TAKEOUT_REQUIRED`, as Telegram does.
+   */
+  async takeout(scope: TakeoutScope): Promise<TelegramTakeout> {
+    const generation = await this.request(
+      "initTakeout",
       () => {
-        const corpus = this.server.account(this.authorizeCurrent());
-        const chat = corpus.chats?.find((c) => c.chat.id === chatId);
-        const messages = (chat?.messages ?? [])
-          .filter((m) => (opts.offsetId === 0 || m.id < opts.offsetId) && m.id > (opts.minId ?? 0))
-          .sort((a, b) => b.id - a.id)
-          .slice(0, opts.limit);
-        return { messages, users: this.server.usersOf(corpus, messages, chat?.chat) };
+        this.authorizeCurrent();
+        return this.server.openTakeout(scope);
       },
-      { chatId, ...opts },
+      scope,
     );
+    const valid = (): void => {
+      if (this.server.validTakeout !== generation) {
+        throw new TelegramError("takeout", "TAKEOUT_INVALID", { rpc: "TAKEOUT_INVALID" });
+      }
+    };
+    return {
+      scope,
+      getHistory: (chatId, opts) =>
+        this.request(
+          "takeoutGetHistory",
+          () => {
+            valid();
+            const chat = this.server
+              .account(this.authorizeCurrent())
+              .chats?.find((c) => c.chat.id === chatId)?.chat;
+            if (chat && !inTakeoutScope(chat, scope)) {
+              throw new TelegramError("takeout", "TAKEOUT_REQUIRED", { rpc: "TAKEOUT_REQUIRED" });
+            }
+            return this.historyPage(chatId, opts);
+          },
+          { chatId, ...opts },
+        ),
+      finish: (success) =>
+        this.request(
+          "finishTakeout",
+          () => {
+            valid();
+            this.server.validTakeout = 0;
+          },
+          { success },
+        ),
+    };
   }
 
   getMessages(chatId: number, ids: number[]): Promise<(TgMessage | null)[]> {
@@ -634,10 +729,23 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
     });
   }
 
-  async *iterForumTopics(): AsyncIterable<{ id: number; title: string }> {
-    await this.request("iterForumTopics", () => this.authorizeCurrent());
-    // No simulated forums yet.
-    yield* [];
+  async *iterForumTopics(chatId: number): AsyncIterable<{ id: number; title: string }> {
+    const topics = await this.request(
+      "iterForumTopics",
+      () => {
+        const entry = this.server
+          .account(this.authorizeCurrent())
+          .chats?.find((c) => c.chat.id === chatId);
+        if (!entry?.chat.isForum) {
+          throw new TelegramError("not-found", "CHANNEL_FORUM_MISSING", {
+            rpc: "CHANNEL_FORUM_MISSING",
+          });
+        }
+        return [...(entry.topics ?? [])];
+      },
+      { chatId },
+    );
+    yield* topics;
   }
 
   /** @internal */
@@ -683,6 +791,21 @@ function chatBox(chat: TgChat): MessageBox {
   return chat.kind === "supergroup" || chat.kind === "forum" || chat.kind === "channel"
     ? `channel:${chat.id}`
     : "common";
+}
+
+function inTakeoutScope(chat: TgChat, scope: TakeoutScope): boolean {
+  switch (chat.kind) {
+    case "private":
+    case "saved":
+      return scope.messageUsers;
+    case "group":
+      return scope.messageChats;
+    case "supergroup":
+    case "forum":
+      return scope.messageMegagroups;
+    case "channel":
+      return scope.messageChannels;
+  }
 }
 
 /** A chat as a live update carries it: Telegram's updates do not say whether it is archived. */

@@ -72,6 +72,12 @@ export interface TelegramMessagesSourceOptions {
   attachmentConfig?: AttachmentExtractionConfig;
   /** Media downloads per page; tests raise it. */
   mediaAttemptsPerPage?: number;
+  /**
+   * Walk the bootstrap through a Telegram data export session
+   * (`initTakeoutSession`) when Telegram grants one. The descriptor turns it
+   * on; tests that are not about it leave it off.
+   */
+  takeout?: boolean;
 }
 
 /** Floor and ceiling of the media wake timer (a 32-bit `setTimeout` clamps past it). */
@@ -82,6 +88,31 @@ const MEDIA_WAKE_MAX_MS = 2_147_483_000;
  * re-check on this cadence instead of waking a sync every second for it.
  */
 const MEDIA_WAKE_OVERDUE_MS = 60_000;
+
+/**
+ * Telegram holds a new data export back until the owner approves it on
+ * another device. The walk goes on without it, so this is information with a
+ * remedy, not a failure.
+ */
+function takeoutApprovalIssue(unwalkedChats: number, retryAt: number | undefined): SyncIssue {
+  const when = retryAt !== undefined ? new Date(retryAt * 1000).toISOString() : undefined;
+  return {
+    scope: "partition",
+    kind: "permission",
+    severity: "info",
+    count: unwalkedChats,
+    subject: "history export",
+    message: `Telegram is waiting for you to approve the history export; history is read more slowly until then${when ? ` (Omnesis asks again at ${when})` : ""}.`,
+    remediation: {
+      summary: "Telegram asks you to approve the history export",
+      steps: [
+        "Open Telegram on your phone and allow the data export request in the notification from Telegram.",
+        "Then resync the Telegram source so the export starts now; otherwise Omnesis asks again later on its own.",
+      ],
+      restartRequired: false,
+    },
+  };
+}
 
 export class TelegramMessagesSource {
   private readonly walker: HistoryWalker;
@@ -121,6 +152,7 @@ export class TelegramMessagesSource {
       ...(this.cutoffTs !== undefined ? { cutoffTs: this.cutoffTs } : {}),
       ...(options.clock ? { clock: options.clock } : {}),
       ...(options.walkLimits ? { limits: options.walkLimits } : {}),
+      ...(options.takeout ? { takeout: provider.takeout } : {}),
     });
   }
 
@@ -138,6 +170,8 @@ export class TelegramMessagesSource {
     archive.resetMediaForResync();
     archive.markAllDirty();
     archive.requestFullReconcile();
+    // An operator who approved a held-back export resyncs to use it now.
+    archive.clearTakeoutDelay();
   }
 
   /** Stop the media wake timer. */
@@ -227,6 +261,7 @@ export class TelegramMessagesSource {
         m.replyToId !== undefined && !inDay.has(m.replyToId) ? [m.replyToId] : [],
       );
       const replies = new Map([...inDay, ...archive.getMessages(day.chatId, replyIds)]);
+      const topics = chat.isForum ? archive.getTopics(day.chatId) : undefined;
       const context = {
         chat,
         messages,
@@ -241,6 +276,7 @@ export class TelegramMessagesSource {
         messages,
         users,
         replies,
+        ...(topics ? { topics } : {}),
         self: {
           id: this.provider.selfId,
           ...(self?.phoneE164 ? { phoneE164: self.phoneE164 } : {}),
@@ -297,6 +333,10 @@ export class TelegramMessagesSource {
         count: Math.max(1, unwalked + (summary.reconcilePending ? 1 : 0)),
         message: `Telegram asked Omnesis to slow down; history resumes at ${new Date(floodUntil * 1000).toISOString()}.`,
       });
+    }
+    const takeout = archive.takeoutState();
+    if (this.options.takeout && takeout.state === "delayed" && unwalked > 0) {
+      issues.push(takeoutApprovalIssue(unwalked, takeout.retryAt));
     }
     // The media backlog, stated once, on the page that ends the run (the host
     // sums issues across a run's pages).

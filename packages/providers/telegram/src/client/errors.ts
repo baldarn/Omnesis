@@ -48,8 +48,11 @@ const FORBIDDEN_TEXTS = new Set([
   "USER_BANNED_IN_CHANNEL",
   "API_ID_INVALID",
   "API_ID_PUBLISHED_FLOOD",
-  "TAKEOUT_REQUIRED",
 ]);
+
+/** Takeout errors: an export not approved yet, or a session that is no longer valid. */
+const TAKEOUT_DELAY = /^TAKEOUT_INIT_DELAY_(%d|\d+)$/u;
+const TAKEOUT_ENDED = new Set(["TAKEOUT_INVALID", "TAKEOUT_REQUIRED"]);
 
 /** Whether an RPC error says the operator's app credential itself is refused. */
 export function isAppCredentialRejected(rpc: string | undefined): boolean {
@@ -61,6 +64,24 @@ export function mapRpcError(err: RpcErrorFields): TelegramError {
   if (isRevocationReason(text)) {
     return new TelegramError("revoked", `Telegram ended this session (${text})`, {
       reason: text,
+      rpc: text,
+    });
+  }
+  // Before the flood check: Telegram sends the export delay with code 420.
+  const delay = TAKEOUT_DELAY.exec(text);
+  if (delay) {
+    const seconds = err.seconds ?? (delay[1] !== "%d" ? Number(delay[1]) : 0);
+    return new TelegramError(
+      "takeout",
+      `Telegram holds the data export for ${seconds}s (${text})`,
+      {
+        seconds,
+        rpc: text,
+      },
+    );
+  }
+  if (TAKEOUT_ENDED.has(text)) {
+    return new TelegramError("takeout", `The Telegram data export session ended (${text})`, {
       rpc: text,
     });
   }

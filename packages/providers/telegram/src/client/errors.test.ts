@@ -38,6 +38,21 @@ describe("mapRpcError", () => {
     expect(mapRpcError({ code: 400, text }).code).toBe(code);
   });
 
+  it.each([
+    [{ code: 420, text: "TAKEOUT_INIT_DELAY_%d", seconds: 86_400 }, 86_400],
+    [{ code: 420, text: "TAKEOUT_INIT_DELAY_3600" }, 3600],
+  ])("%j is a held-back data export of %is, not a flood wait", (fields, seconds) => {
+    const err = mapRpcError(fields);
+    expect(err.code).toBe("takeout");
+    expect(err.detail?.seconds).toBe(seconds);
+  });
+
+  it.each(["TAKEOUT_INVALID", "TAKEOUT_REQUIRED"])("%s ends the data export session", (text) => {
+    const err = mapRpcError({ code: 400, text });
+    expect(err.code).toBe("takeout");
+    expect(err.detail?.seconds).toBeUndefined();
+  });
+
   it("treats server errors as network and anything else as unknown, keeping the RPC text", () => {
     expect(mapRpcError({ code: 500, text: "RPC_CALL_FAIL" }).code).toBe("network");
     expect(mapRpcError({ code: -503, text: "Timeout" }).code).toBe("network");

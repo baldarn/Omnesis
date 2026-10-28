@@ -17,6 +17,7 @@ import { TelegramProvider } from "./provider.js";
 import { writeSessionRecord } from "./session-store.js";
 import { SimulatedTelegram } from "./testing/simulated-telegram.js";
 import {
+  DAVID,
   HELPER_BOT,
   JAMIE,
   SELF,
@@ -97,7 +98,7 @@ describe("TelegramArchive storage", () => {
     }
     const reopened = openArchive();
     expect(reopened.storeId).toBe(id);
-    expect(reopened.getMeta("schema_version")).toBe("3");
+    expect(reopened.getMeta("schema_version")).toBe("4");
     reopened.close();
   });
 
@@ -247,6 +248,23 @@ describe("TelegramArchive writes and drain", () => {
     // The same content again is still a no-op.
     drainAll();
     expect(live(chat, stored(chat, 1, T0, "Second fix", { editTs: T0 + 60 }))).toBe(false);
+  });
+
+  it("skips a message whose common-box id another chat already holds, instead of failing", () => {
+    const other: TgChat = privateChatWith(DAVID);
+    live(chat, stored(chat, 7, T0, "Marathon entry form attached"));
+    drainAll();
+    // Telegram's common box is account-wide, so this should never happen; if
+    // it does, the page must not fail on the deletion index for good.
+    expect(live(other, stored(other, 7, T0 + 60, "Heart-rate trend for the week"))).toBe(false);
+    expect(archive.idCollisionCount()).toBe(1);
+    expect(archive.hasMessage(chat.id, 7)).toBe(true);
+    expect(archive.hasMessage(other.id, 7)).toBe(false);
+    expect(archive.dirtyDayCount()).toBe(0);
+    // The same message in its own chat still updates as usual.
+    expect(live(chat, stored(chat, 7, T0, "Marathon entry form v2", { editTs: T0 + 90 }))).toBe(
+      true,
+    );
   });
 
   it("deletes a common-box message through the id index, with no chat named", () => {
@@ -515,6 +533,6 @@ describe("TelegramArchive media lifecycle", () => {
     raw.close();
     archive = TelegramArchive.open(dir, null, { now: () => clock });
     expect(read(1)).toMatchObject({ mediaState: "pending", mediaNextAttempt: 0 });
-    expect(archive.getMeta("schema_version")).toBe("3");
+    expect(archive.getMeta("schema_version")).toBe("4");
   });
 });

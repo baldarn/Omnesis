@@ -25,7 +25,7 @@ import { loadAppCredentials } from "./credentials-spec.js";
 import { telegramDeviceInfo } from "./device.js";
 import { CONNECT_TIMEOUT_MS, GAP_SUSPECT_OUTAGE_S } from "./limits.js";
 import { extractMessage } from "./message-extractor.js";
-import { isChatIncluded, type ChatPolicy } from "./history-walker.js";
+import { isChatIncluded, type ChatPolicy, type TakeoutHolder } from "./history-walker.js";
 import { TelegramArchive, type StoredUser } from "./message-store.js";
 import { readTelegramStoreKey } from "./protected-store.js";
 import {
@@ -70,6 +70,11 @@ type ConnectOutcome = { ok: true; self: TgUser } | { ok: false; error: unknown }
 
 export class TelegramProvider {
   readonly accountId: string;
+  /**
+   * The bootstrap's data export session, once open. Kept here rather than on
+   * the source so a config change, which rebuilds the source, reuses it.
+   */
+  readonly takeout: TakeoutHolder = { takeout: undefined };
   private readonly configDir: string;
   private readonly now: () => Date;
   private connecting: Promise<ConnectOutcome> | undefined;

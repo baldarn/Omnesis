@@ -37,6 +37,7 @@ import {
   type User,
 } from "@mtcute/node";
 import { LogManager } from "@mtcute/core/utils.js";
+import { getHistory as getHistoryThrough } from "@mtcute/core/methods.js";
 import { createLogger, toErrorMessage } from "@omnesis/core";
 import { FLOOD_SLEEP_MAX_MS, MEDIA_DOWNLOAD_STALL_MS } from "../../limits.js";
 import { downloadWithReferenceRefresh } from "../download.js";
@@ -49,7 +50,9 @@ import {
   type DeviceInfo,
   type MessageBox,
   type TelegramAdapter,
+  type TakeoutScope,
   type TelegramAuthAdapter,
+  type TelegramTakeout,
   type TgChat,
   type TgDialog,
   type TgDownloaded,
@@ -64,6 +67,7 @@ import { createMtcuteStorage } from "./storage.js";
 const log = createLogger("provider:telegram").child("mtcute");
 
 type ClientOptions = ConstructorParameters<typeof BaseTelegramClient>[0];
+type HistoryParams = NonNullable<Parameters<TelegramClient["getHistory"]>[1]>;
 
 function clientOptions(creds: AppCredentials, device: DeviceInfo): Omit<ClientOptions, "storage"> {
   return {
@@ -235,8 +239,16 @@ class MtcuteTelegramAdapter implements TelegramAdapter {
     chatId: number,
     opts: { offsetId: number; limit: number; minId?: number; signal?: AbortSignal },
   ): Promise<{ messages: TgMessage[]; users: TgUser[] }> {
+    return this.historyPage((params) => this.client.getHistory(chatId, params), opts);
+  }
+
+  /** One history page through `read`, converted; shared by the plain and the takeout reads. */
+  private historyPage(
+    read: (params: HistoryParams) => Promise<Message[]>,
+    opts: { offsetId: number; limit: number; minId?: number },
+  ): Promise<{ messages: TgMessage[]; users: TgUser[] }> {
     return this.guard(async () => {
-      const page = await this.client.getHistory(chatId, {
+      const page = await read({
         limit: opts.limit,
         ...(opts.offsetId ? { offset: { id: opts.offsetId, date: 0 } } : {}),
         ...(opts.minId ? { minId: opts.minId } : {}),
@@ -244,6 +256,26 @@ class MtcuteTelegramAdapter implements TelegramAdapter {
       const self = this.requireSelf();
       return { messages: page.map((m) => convertMessage(m)), users: sendersOf(page, self) };
     });
+  }
+
+  /**
+   * `account.initTakeoutSession` with `files: false`, so media stays on the
+   * lazy download path of the normal client. History is read with mtcute's
+   * own `getHistory` over the session's proxy, which wraps every call in
+   * `invokeWithTakeout`; the flood waiter middleware applies to it as to any
+   * call, and its waits surface as the walk's own flood wait.
+   */
+  async takeout(scope: TakeoutScope): Promise<TelegramTakeout> {
+    const session = await this.guard(() =>
+      this.client.initTakeoutSession({ ...scope, contacts: false, files: false }),
+    );
+    const proxy = session.createProxy();
+    return {
+      scope,
+      getHistory: (chatId, opts) =>
+        this.historyPage((params) => getHistoryThrough(proxy, chatId, params), opts),
+      finish: (success) => this.guard(() => session.finish(success)),
+    };
   }
 
   getMessages(chatId: number, ids: number[]): Promise<(TgMessage | null)[]> {
@@ -279,9 +311,13 @@ class MtcuteTelegramAdapter implements TelegramAdapter {
     });
   }
 
-  async *iterForumTopics(chatId: number): AsyncIterable<{ id: number; title: string }> {
+  async *iterForumTopics(
+    chatId: number,
+    opts?: { signal?: AbortSignal },
+  ): AsyncIterable<{ id: number; title: string }> {
     const iterator = this.client.iterForumTopics(chatId)[Symbol.asyncIterator]();
     while (true) {
+      opts?.signal?.throwIfAborted();
       const next = await this.guard(() => iterator.next());
       if (next.done) return;
       yield { id: next.value.id, title: next.value.title };

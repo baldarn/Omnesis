@@ -18,14 +18,12 @@
  */
 
 import { loadActiveUniverse, loadSourceFixtureJson } from "@omnesis/providers-synth-common";
-import { SimulatedTelegram } from "@omnesis/provider-telegram/testing";
+import { SimulatedTelegram, type SimulatedChat } from "@omnesis/provider-telegram/testing";
 import type {
   ChatKind,
   MessageBox,
   TelegramProvider,
-  TgChat,
   TgMediaRef,
-  TgMessage,
   TgUser,
 } from "@omnesis/provider-telegram";
 
@@ -49,6 +47,8 @@ interface FixtureMessage {
   from: number;
   text: string;
   replyTo?: number;
+  /** The forum topic the message is posted in (a `topics` id of its chat). */
+  topic?: number;
   /**
    * The message's media. `content` is the file's bytes as UTF-8 text, which
    * the simulated server serves for download: a document's text, or what a
@@ -64,6 +64,8 @@ interface FixtureChat {
   title: string;
   username?: string;
   isArchived?: boolean;
+  /** A forum's topics. */
+  topics?: Array<{ id: number; title: string }>;
   messages: FixtureMessage[];
 }
 
@@ -118,7 +120,7 @@ function boxOf(chat: FixtureChat): MessageBox {
 function simulatedCorpus(fixture: TelegramFakeCorpusFixture): {
   self: TgUser;
   users: TgUser[];
-  chats: Array<{ chat: TgChat; messages: TgMessage[] }>;
+  chats: SimulatedChat[];
 } {
   const selfId = fixture.self.id;
   const users = fixture.users.map((u) => toUser(u, selfId));
@@ -141,6 +143,7 @@ function simulatedCorpus(fixture: TelegramFakeCorpusFixture): {
         topMessageId: Math.max(0, ...c.messages.map((m) => m.id)),
         isForum: c.kind === "forum",
       },
+      ...(c.topics ? { topics: c.topics } : {}),
       messages: c.messages.map((m) => ({
         chatId: c.id,
         id: m.id,
@@ -151,6 +154,7 @@ function simulatedCorpus(fixture: TelegramFakeCorpusFixture): {
         outgoing: m.from === selfId,
         text: m.text,
         ...(m.replyTo ? { replyToId: m.replyTo } : {}),
+        ...(m.topic ? { topicId: m.topic } : {}),
         ...(m.media ? { media: fixtureMedia(m.media) } : {}),
       })),
     })),

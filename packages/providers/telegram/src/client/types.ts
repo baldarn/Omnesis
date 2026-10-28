@@ -154,6 +154,12 @@ export type TelegramErrorCode =
   | "forbidden"
   | "network"
   | "cancelled"
+  /**
+   * A takeout (data export) session cannot be used: Telegram holds a new one
+   * back until the owner approves it (`TAKEOUT_INIT_DELAY_%d`, with
+   * `seconds`), or the one in use ended (`TAKEOUT_INVALID`, `TAKEOUT_REQUIRED`).
+   */
+  | "takeout"
   | "unknown";
 
 /** Every failure the adapter reports, already classified. */
@@ -225,8 +231,38 @@ export interface TelegramAdapter {
     target: TgMediaDownload,
     opts: { maxBytes: number; signal?: AbortSignal },
   ): Promise<TgDownloaded>;
-  /** Phase 4. */
-  iterForumTopics(chatId: number): AsyncIterable<{ id: number; title: string }>;
+  /** A forum's topics, every page of them. */
+  iterForumTopics(
+    chatId: number,
+    opts?: { signal?: AbortSignal },
+  ): AsyncIterable<{ id: number; title: string }>;
+  /**
+   * Open a takeout (data export) session: history read through it counts
+   * against Telegram's export limits instead of the interactive ones. Fails
+   * with a `takeout` error carrying `seconds` while Telegram waits for the
+   * owner to approve the export on another device.
+   */
+  takeout(scope: TakeoutScope): Promise<TelegramTakeout>;
+}
+
+/** Which kinds of chat a takeout session may export. Files are never exported through it. */
+export interface TakeoutScope {
+  messageUsers: boolean;
+  messageChats: boolean;
+  messageMegagroups: boolean;
+  messageChannels: boolean;
+}
+
+/** An open takeout session: only what the backward history walk needs. */
+export interface TelegramTakeout {
+  readonly scope: TakeoutScope;
+  /** As {@link TelegramAdapter.getHistory}, through the export session. */
+  getHistory(
+    chatId: number,
+    opts: { offsetId: number; limit: number; signal?: AbortSignal },
+  ): Promise<{ messages: TgMessage[]; users: TgUser[] }>;
+  /** End the session; `success` says the export finished. */
+  finish(success: boolean): Promise<void>;
 }
 
 /** A client used only to sign in. It keeps nothing on disk. */

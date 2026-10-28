@@ -202,6 +202,7 @@ export function buildTelegramProvider(
             attachmentConfig: resolveAttachmentConfig(sourceConfig, { defaultEnabled: true }),
             ...(host?.transcribeAudio ? { transcribeAudio: host.transcribeAudio } : {}),
             ...(host?.extractAttachment ? { extractAttachment: host.extractAttachment } : {}),
+            takeout: true,
             walkLimits: {
               requestsPerPage: positiveInt(options?.historyRequestsPerPage, WALK_REQUESTS_PER_PAGE),
               minIntervalMs: positiveInt(options?.historyMinIntervalMs, HISTORY_MIN_INTERVAL_MS),

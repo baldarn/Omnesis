@@ -104,7 +104,9 @@ export function classifyDownloadFailure(err: unknown, signal?: AbortSignal): Dow
       return { kind: "terminal", error: err.message };
     // A second stale reference right after a refresh, or a client-side
     // timeout: neither says the file is gone.
+    // Downloads never go through a takeout session; treated as any oddity.
     case "file-reference-expired":
+    case "takeout":
     case "cancelled":
     case "network":
     case "unknown":

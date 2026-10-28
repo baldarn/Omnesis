@@ -12288,8 +12288,10 @@
       "value": "Jamie Lopez",
       "paths": [
         "evals/universes/telegram-sync/cast.json",
+        "packages/collector/src/e2e/telegram-sync.e2e.test.ts",
         "packages/providers/telegram/src/client/mtcute/adapter.test.ts",
         "packages/providers/telegram/src/document-event-profile.test.ts",
+        "packages/providers/telegram/src/forum-topics.test.ts",
         "packages/providers/telegram/src/media.test.ts",
         "packages/providers/telegram/src/normalizer.test.ts"
       ],
@@ -12299,13 +12301,21 @@
       "value": "David Lin",
       "paths": [
         "evals/universes/telegram-sync/cast.json",
+        "packages/collector/src/e2e/telegram-sync.e2e.test.ts",
+        "packages/providers/telegram/src/document-event-profile.test.ts",
+        "packages/providers/telegram/src/forum-topics.test.ts",
         "packages/providers/telegram/src/normalizer.test.ts"
       ],
       "reason": "invented Telegram fixture name from the CLAUDE.md example set (people, venues and vendors), not corpus data."
     },
     {
       "value": "Stellar Sound",
-      "paths": ["evals/universes/telegram-sync/sources/telegram-messages/fake-corpus.json"],
+      "paths": [
+        "evals/universes/telegram-sync/sources/telegram-messages/fake-corpus.json",
+        "packages/providers/telegram/src/forum-topics.test.ts",
+        "packages/providers/telegram/src/messages.test.ts",
+        "packages/providers/telegram/src/takeout.test.ts"
+      ],
       "reason": "invented Telegram fixture name from the CLAUDE.md example set (people, venues and vendors), not corpus data."
     },
     {
@@ -12313,10 +12323,13 @@
       "paths": [
         "evals/universes/telegram-sync/sources/telegram-messages/fake-corpus.json",
         "packages/providers/telegram/src/client/mtcute/adapter.test.ts",
+        "packages/providers/telegram/src/document-event-profile.test.ts",
+        "packages/providers/telegram/src/forum-topics.test.ts",
         "packages/providers/telegram/src/history-walker.test.ts",
         "packages/providers/telegram/src/message-store.test.ts",
         "packages/providers/telegram/src/messages.test.ts",
-        "packages/providers/telegram/src/normalizer.test.ts"
+        "packages/providers/telegram/src/normalizer.test.ts",
+        "packages/providers/telegram/src/takeout.test.ts"
       ],
       "reason": "invented Telegram fixture name from the CLAUDE.md example set (people, venues and vendors), not corpus data."
     },

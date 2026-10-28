@@ -473,3 +473,61 @@ describe("MtcuteTelegramAdapter.downloadMedia", () => {
     });
   });
 });
+
+describe("MtcuteTelegramAdapter.takeout", () => {
+  const SCOPE = {
+    messageUsers: true,
+    messageChats: true,
+    messageMegagroups: true,
+    messageChannels: false,
+  };
+
+  function adapterWith(initTakeoutSession: (params: unknown) => Promise<unknown>) {
+    const dir = mkdtempSync(join(tmpdir(), "omnesis-telegram-adapter-"));
+    const adapter = mtcuteAdapterFactory.live(
+      { apiId: 1234567, apiHash: "0123456789abcdef0123456789abcdef" },
+      { dir, key: null },
+      { deviceModel: "Test", systemVersion: "1", appVersion: "1", langCode: "en" },
+    );
+    const client = (adapter as unknown as { client: Record<string, unknown> }).client;
+    const init = vi.fn(initTakeoutSession);
+    client.initTakeoutSession = init;
+    return {
+      adapter,
+      init,
+      async dispose() {
+        await adapter.close();
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("asks for an export of messages only, never files or contacts, and finishes it", async () => {
+    const finish = vi.fn(() => Promise.resolve());
+    const { adapter, init, dispose } = adapterWith(() =>
+      Promise.resolve({ createProxy: () => ({}), finish }),
+    );
+    try {
+      const takeout = await adapter.takeout(SCOPE);
+      expect(init).toHaveBeenCalledWith({ ...SCOPE, contacts: false, files: false });
+      expect(takeout.scope).toEqual(SCOPE);
+      await takeout.finish(true);
+      expect(finish).toHaveBeenCalledWith(true);
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("reports an export held back for approval as a takeout error, not a flood wait", async () => {
+    const delay = Object.assign(new tl.RpcError(420, "TAKEOUT_INIT_DELAY_%d"), { seconds: 86_400 });
+    const { adapter, dispose } = adapterWith(() => Promise.reject(delay));
+    try {
+      await expect(adapter.takeout(SCOPE)).rejects.toMatchObject({
+        code: "takeout",
+        detail: { seconds: 86_400 },
+      });
+    } finally {
+      await dispose();
+    }
+  });
+});

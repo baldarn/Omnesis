@@ -78,6 +78,12 @@ export const telegramDocumentEventProfile: DocumentEventProfile = {
       semantics: "message-count",
     },
     {
+      path: "extra.topics",
+      type: "string-array",
+      description:
+        "On a forum conversation, the titles of the topics that day's messages were posted in. Absent when no message names a topic.",
+    },
+    {
       path: "extra.mediaCount",
       type: "number",
       description:

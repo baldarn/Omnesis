@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { expectUnchangedUpstreamIsNoOp } from "@omnesis/source-sdk/testing";
 import { SyncError } from "@omnesis/types";
+import { resolveAttachmentConfig } from "@omnesis/core";
 import {
   DAVID,
   JAMIE,
@@ -108,6 +109,88 @@ describe("TelegramMessagesSource.sync", () => {
     const page = await r.source.sync(boot.cursor);
     expect(page.deletedExternalIds).toEqual([`${DAVID.id}:2026-03-11`]);
     expect(page.documents).toEqual([]);
+  });
+
+  it("walks channels only once switched on, and removes their days and files when switched off", async () => {
+    const channel = chatOf(-1007000000002, "channel", "Stellar Sound announcements");
+    const brochure = {
+      kind: "document" as const,
+      fileId: "brochure",
+      fileName: "tour.txt",
+      mimeType: "text/plain",
+      size: 24,
+      isViewOnce: false,
+    };
+    const extractor = {
+      attachmentConfig: resolveAttachmentConfig(undefined, { defaultEnabled: true }),
+      extractAttachment: (data: Uint8Array) =>
+        Promise.resolve({ text: new TextDecoder().decode(data), truncated: false }),
+    };
+    rig = await syncRig(
+      {
+        users: [JAMIE],
+        chats: [
+          { chat: JAMIE_CHAT, messages: messageRun(JAMIE_CHAT, JAMIE, 1, 2, T0) },
+          {
+            chat: channel,
+            messages: [
+              messageIn(channel, 1, T0, "Tour dates are out"),
+              messageIn(channel, 2, T0 + 60, "", { media: brochure }),
+            ],
+          },
+        ],
+      },
+      extractor,
+    );
+    rig.sim.setMedia("brochure", new TextEncoder().encode("Spring tour in four cities"));
+    const off = await syncAll(rig.source, null);
+    expect([...latestDocs(off.pages).keys()]).toEqual([JAMIE_DAY]);
+    expect(
+      rig.sim.calls.some(
+        (c) => c.method === "getHistory" && (c.args as { chatId: number }).chatId === channel.id,
+      ),
+    ).toBe(false);
+
+    const channelDay = `${channel.id}:2026-03-10`;
+    rig.remake({ ...extractor, policy: { includeChannels: true, excludedChats: [] } });
+    const on = await syncAll(rig.source, off.cursor);
+    const published = latestDocs(on.pages);
+    expect(published.get(channelDay)?.content).toContain("Tour dates are out");
+    const file = [...published.values()].find((d) => d.metadata.documentType === "attachment");
+    expect(file?.externalId.startsWith(`${channelDay}/att/`)).toBe(true);
+    expect(file?.content).toContain("Spring tour in four cities");
+
+    rig.remake({ ...extractor, policy: { includeChannels: false, excludedChats: [] } });
+    const purged = await syncAll(rig.source, on.cursor);
+    const removed = purged.pages.flatMap((p) => p.deletedExternalIds);
+    expect(removed.sort()).toEqual([channelDay, file!.externalId].sort());
+    expect(purged.pages.flatMap((p) => p.documents)).toEqual([]);
+    expect(rig.provider.getArchive().getChat(channel.id)?.walkState).toBe("excluded");
+    expect(rig.provider.getArchive().hasMessage(channel.id, 1)).toBe(false);
+
+    // Settled: the next page tombstones nothing again.
+    const next = await rig.source.sync(purged.cursor);
+    expect(next.deletedExternalIds).toEqual([]);
+  });
+
+  it("walks past a common-box id two chats claim, every time, without failing the page", async () => {
+    rig = await syncRig({
+      users: [JAMIE, DAVID],
+      chats: [
+        { chat: JAMIE_CHAT, messages: messageRun(JAMIE_CHAT, JAMIE, 1, 3, T0) },
+        // David's chat reuses Jamie's id 2 in the account-wide box.
+        { chat: DAVID_CHAT, messages: messageRun(DAVID_CHAT, DAVID, 2, 1, T0 + 86_400) },
+      ],
+    });
+    const boot = await syncAll(rig.source, null);
+    const archive = rig.provider.getArchive();
+    expect(archive.idCollisionCount()).toBe(1);
+    expect(archive.messageCount()).toBe(3);
+    expect(boot.pages.at(-1)!.progress).toMatchObject({ coverage: "complete" });
+    // A full reconcile reads it again and still settles.
+    archive.requestFullReconcile();
+    const again = await syncAll(rig.source, boot.cursor);
+    expect(again.pages.at(-1)!.hasMore).toBe(false);
   });
 
   it("re-emits the outstanding backlog for a cursor from another archive", async () => {

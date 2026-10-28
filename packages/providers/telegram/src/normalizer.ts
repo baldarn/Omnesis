@@ -46,6 +46,8 @@ export interface DayRenderInput {
   users: ReadonlyMap<number, StoredUser>;
   /** Messages the day replies to, by id, when the archive holds them. */
   replies: ReadonlyMap<number, StoredMessage>;
+  /** A forum's topic titles by topic id; a message in an unknown topic renders without one. */
+  topics?: ReadonlyMap<number, string>;
   self: { id: number; phoneE164?: string };
   providerId: ProviderId;
   sourceId: SourceId;
@@ -131,9 +133,13 @@ export function normalizeDayChat(input: DayRenderInput): DocumentInput {
     return user?.displayName ?? m.senderName ?? "Unknown";
   };
 
+  const topicOf = (m: StoredMessage): string | undefined =>
+    m.topicId !== undefined ? input.topics?.get(m.topicId) : undefined;
   const lines = [`# ${chat.title} — ${date}`, ""];
-  for (const m of messages) lines.push(renderMessage(m, senderName, replies));
+  for (const m of messages) lines.push(renderMessage(m, senderName, replies, topicOf(m)));
   const content = lines.join("\n");
+  // The forum topics the day's messages were posted in, in order of first appearance.
+  const topics = [...new Set(messages.flatMap((m) => topicOf(m) ?? []))];
 
   // People: self first, the other side of a private chat, then whoever spoke.
   const people: PersonMention[] = [
@@ -211,6 +217,7 @@ export function normalizeDayChat(input: DayRenderInput): DocumentInput {
         messageCount: messages.filter((m) => !m.service).length,
         mediaCount: messages.filter((m) => m.media && m.media.kind !== "webpage").length,
         participants: [...participants],
+        ...(topics.length > 0 ? { topics } : {}),
         date,
       },
     },
@@ -237,8 +244,9 @@ function renderMessage(
   m: StoredMessage,
   senderName: (m: Pick<StoredMessage, "outgoing" | "senderId" | "senderName">) => string,
   replies: ReadonlyMap<number, StoredMessage>,
+  topic: string | undefined,
 ): string {
-  const time = `**${formatTime(m.ts)}**`;
+  const time = topic ? `**${formatTime(m.ts)}** [#${topic}]` : `**${formatTime(m.ts)}**`;
   const sender = senderName(m);
   if (m.service) return `${time} _${sender} ${servicePhrase(m.service)}_`;
 
