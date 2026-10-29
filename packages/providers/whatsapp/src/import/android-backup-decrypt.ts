@@ -273,7 +273,9 @@ export function decryptMsgstore(
   const aesKey = deriveAesKey(resolveRootKey(keyInput));
   let compressed: Buffer;
   try {
-    const decipher = createDecipheriv("aes-256-gcm", aesKey, header.iv);
+    const decipher = createDecipheriv("aes-256-gcm", aesKey, header.iv, {
+      authTagLength: GCM_TAG_LEN,
+    });
     decipher.setAuthTag(tag);
     compressed = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   } catch {
