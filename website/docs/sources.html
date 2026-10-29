@@ -267,8 +267,9 @@
                 </td>
                 <td>
                   Messages as conversational documents, live as they arrive, plus an optional
-                  one-time full-history import from an iPhone backup. Media text is extracted, and
-                  voice notes are transcribed
+                  one-time full-history import from an iPhone or Android backup — see
+                  <a href="#whatsapp-backup-import">WhatsApp full-history import</a>. Media text is
+                  extracted, and voice notes are transcribed
                   <a href="/docs/operating#models">when a transcriber model is assigned</a>. Until a
                   note is transcribed its placeholder says why (<code
                     >[Voice note, 0:12 — awaiting transcription]</code
@@ -458,6 +459,44 @@
             <strong>One machine per mailbox.</strong> Each machine's Maildir is its own source. The
             same account mirrored on two machines and added on both is two sources with the same
             messages; add it on one.
+          </li>
+        </ul>
+
+        <h3 id="whatsapp-backup-import">WhatsApp full-history import</h3>
+        <p>
+          WhatsApp's linked-device sync only streams a companion a recent window of messages, not
+          the full history on the phone. To recover older messages, import them once from a local
+          phone backup. An import adds only the history actually present in the backup you provide —
+          it is not a guaranteed universal lookback window. Run it with
+          <code>omnesis sources import-history &lt;sourceId&gt;</code>; imported messages merge into
+          the source by stable id, so re-running an import is safe and adds nothing already present,
+          and a message already captured by live sync is never overwritten by a sparser imported
+          copy.
+        </p>
+        <ul>
+          <li>
+            <strong>iPhone.</strong> Needs the encrypted backup folder Finder (or iTunes on Windows)
+            writes — the folder containing <code>Manifest.plist</code> — and the password set when
+            backup encryption was turned on.
+          </li>
+          <li>
+            <strong>Android.</strong> Needs the exported <code>msgstore.db.crypt15</code> file
+            pulled from the device, and the 64-character encryption key WhatsApp showed once when
+            end-to-end backup encryption was turned on (or the raw key file extracted alongside it).
+            Only this single-file backup layout is supported; WhatsApp's chunked, incremental
+            Google-Drive backup format is not.
+          </li>
+          <li>
+            <strong>Limits.</strong> An imported attachment carries its filename, type, and size,
+            but never the original file — a backup does not retain a live download session, so
+            imported media is never downloadable the way a live-synced attachment is.
+          </li>
+          <li>
+            <strong>Recovery.</strong> A wrong password or key fails the import with a clear message
+            rather than a partial result. A backup in an unrecognized or unsupported format is
+            refused by name instead of crashing. Cancelling stops the import and deletes its
+            decrypted working files; messages already imported stay, and running the import again
+            adds the rest without duplicating them.
           </li>
         </ul>
 
