@@ -12,6 +12,7 @@ import {
   GCM_IV_LEN,
   GCM_TAG_LEN,
   MAX_DECOMPRESSED_BYTES,
+  MAX_HEADER_LEN,
   MSGSTORE_FEATURES_FLAG,
   ROOT_KEY_HEX_LEN,
   ROOT_KEY_LEN,
@@ -26,7 +27,7 @@ import {
  * here alone (see the importer's risk notes).
  *
  * Container (single-file local-backup layout only):
- *   [1-byte header_len][optional 0x01 features flag][header_len bytes: BackupPrefix protobuf, carries the GCM IV]
+ *   [varint header_len][optional 0x01 features flag][header_len bytes: BackupPrefix protobuf, carries the GCM IV]
  *   [ciphertext = AES-256-GCM(zlib(msgstore.db))]
  *   [16-byte GCM auth tag][16-byte MD5(every preceding byte) — plain integrity checksum]
  *
@@ -183,22 +184,21 @@ function findField(buf: Buffer, fieldNumber: number, wireType: number): ProtoFie
 export interface Crypt15Header {
   /** 16-byte GCM IV, from BackupPrefix.e2ee_key_data.encryption_iv. */
   iv: Buffer;
-  /** Total bytes consumed by the size byte, the optional flag and the header body — ciphertext starts here. */
+  /** Total bytes consumed by the size varint, the optional flag and the header body — ciphertext starts here. */
   headerLen: number;
 }
 
 /**
- * Parses the leading `[1-byte len][optional features flag][BackupPrefix protobuf]`
- * header of a crypt15 file. The size is a single byte, not a varint: a
- * flagged header of 128+ bytes reads the same either way, which is why a
- * varint reader only appears to work on `msgstore.db.crypt15`.
+ * Parses the leading `[varint len][optional features flag][BackupPrefix protobuf]`
+ * header of a crypt15 file. The size is a protobuf varint (real headers
+ * exceed 255 bytes); the flag byte is skipped when present.
  */
 export function parseCrypt15Header(buf: Buffer): Crypt15Header {
-  const declaredLen = buf[0];
-  if (!declaredLen) {
-    throw new UnsupportedBackupFormatError("Backup header length is missing.");
+  const [declaredLen, afterLen] = readVarint(buf, 0);
+  if (declaredLen <= 0 || declaredLen > MAX_HEADER_LEN) {
+    throw new UnsupportedBackupFormatError("Backup header length is missing or implausible.");
   }
-  const bodyStart = buf[1] === MSGSTORE_FEATURES_FLAG ? 2 : 1;
+  const bodyStart = buf[afterLen] === MSGSTORE_FEATURES_FLAG ? afterLen + 1 : afterLen;
   const bodyEnd = bodyStart + declaredLen;
   if (bodyEnd > buf.length) {
     throw new CorruptBackupError(

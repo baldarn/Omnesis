@@ -41,7 +41,7 @@ function encodeLengthDelimited(fieldNumber: number, data: Buffer): Buffer {
 }
 
 /**
- * Builds the `[1-byte header_len][optional features flag][BackupPrefix protobuf]`
+ * Builds the `[varint header_len][optional features flag][BackupPrefix protobuf]`
  * header carrying `iv`. `paddingBytes` adds an unrelated length-delimited
  * field, as real headers carry (app version, feature bits), so a test can
  * reach a 128+ byte header.
@@ -52,9 +52,8 @@ function buildCrypt15Header(iv: Buffer, featuresFlag: boolean, paddingBytes: num
     encodeLengthDelimited(3, c15iv), // BackupPrefix.e2ee_key_data
     ...(paddingBytes > 0 ? [encodeLengthDelimited(5, Buffer.alloc(paddingBytes, 0x61))] : []),
   ]);
-  if (header.length > 0xff) throw new Error(`crypt15 header too long: ${header.length}`);
   return Buffer.concat([
-    Buffer.from([header.length]),
+    encodeVarint(header.length),
     ...(featuresFlag ? [Buffer.from([0x01])] : []),
     header,
   ]);
@@ -77,6 +76,8 @@ export interface AndroidFixtureMessage {
   text: string | null;
   /** Sender JID for a group message not sent by me. */
   senderJid?: string;
+  /** A media message's caption: `text_data` on the modern schema, `media_caption` on the legacy one. */
+  caption?: string;
   quoted?: { keyId: string; text: string; senderJid?: string };
   media?: { filePath?: string; mimeType?: string; fileSize?: number };
   lat?: number;
@@ -93,7 +94,11 @@ export interface AndroidFixtureCorpus {
  * `schema` selects which generation to emit:
  * - `"modern"` (default): `message`/`chat`/`jid`/`message_quoted`/`message_media`.
  * - `"legacy"`: `messages`/`messages_quotes`/`message_media`, with the chat JID
- *   stored directly on the message row (no `jid` lookup table).
+ *   stored directly on the message row (no `jid` lookup table). A quote row is
+ *   reached through `messages.quoted_row_id` and a media row through
+ *   `message_media.message_row_id`; both satellite tables number their own
+ *   `_id`s from 1, so they collide with unrelated message ids the way a real
+ *   database's do, and a join on `_id` attaches the wrong row.
  */
 export function buildMsgstoreDb(
   corpus: AndroidFixtureCorpus,
@@ -150,7 +155,16 @@ export function buildMsgstoreDb(
 
       for (const m of corpus.messages) {
         const senderRowId = m.senderJid != null ? internJid(m.senderJid) : null;
-        msgIns.run(m.id, m.keyId, m.chatId, senderRowId, m.fromMe, m.tsMs, m.type, m.text);
+        msgIns.run(
+          m.id,
+          m.keyId,
+          m.chatId,
+          senderRowId,
+          m.fromMe,
+          m.tsMs,
+          m.type,
+          m.caption ?? m.text,
+        );
         if (m.quoted) {
           quoteIns.run(
             m.id,
@@ -172,28 +186,32 @@ export function buildMsgstoreDb(
       db.exec(`
         CREATE TABLE messages (
           _id INTEGER PRIMARY KEY, key_id TEXT, key_remote_jid TEXT, key_from_me INTEGER,
-          timestamp INTEGER, media_wa_type INTEGER, data TEXT, remote_resource TEXT,
-          latitude REAL, longitude REAL
+          timestamp INTEGER, media_wa_type INTEGER, data TEXT, media_caption TEXT,
+          remote_resource TEXT, quoted_row_id INTEGER, latitude REAL, longitude REAL
         );
         CREATE TABLE messages_quotes (
-          _id INTEGER, key_id TEXT, data TEXT, remote_resource TEXT
+          _id INTEGER PRIMARY KEY, key_id TEXT, data TEXT, remote_resource TEXT
         );
         CREATE TABLE message_media (
-          _id INTEGER, file_path TEXT, mime_type TEXT, file_size INTEGER
+          _id INTEGER PRIMARY KEY, message_row_id INTEGER, file_path TEXT, mime_type TEXT,
+          file_size INTEGER
         );
       `);
       const msgIns = db.prepare(`
-        INSERT INTO messages (_id, key_id, key_remote_jid, key_from_me, timestamp, media_wa_type, data, remote_resource, latitude, longitude)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO messages (_id, key_id, key_remote_jid, key_from_me, timestamp, media_wa_type, data, media_caption, remote_resource, quoted_row_id, latitude, longitude)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
       `);
       const quoteIns = db.prepare(
-        `INSERT INTO messages_quotes (_id, key_id, data, remote_resource) VALUES (?,?,?,?)`,
+        `INSERT INTO messages_quotes (key_id, data, remote_resource) VALUES (?,?,?)`,
       );
       const mediaIns = db.prepare(
-        `INSERT INTO message_media (_id, file_path, mime_type, file_size) VALUES (?,?,?,?)`,
+        `INSERT INTO message_media (message_row_id, file_path, mime_type, file_size) VALUES (?,?,?,?)`,
       );
       for (const m of corpus.messages) {
         const chat = chatById.get(m.chatId);
+        const quotedRowId = m.quoted
+          ? quoteIns.run(m.quoted.keyId, m.quoted.text, m.quoted.senderJid ?? null).lastInsertRowid
+          : null;
         msgIns.run(
           m.id,
           m.keyId,
@@ -202,13 +220,12 @@ export function buildMsgstoreDb(
           m.tsMs,
           m.type,
           m.text,
+          m.caption ?? null,
           m.senderJid ?? null,
+          quotedRowId,
           m.lat ?? 0,
           m.lon ?? 0,
         );
-        if (m.quoted) {
-          quoteIns.run(m.id, m.quoted.keyId, m.quoted.text, m.quoted.senderJid ?? null);
-        }
         if (m.media) {
           mediaIns.run(
             m.id,

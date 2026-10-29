@@ -27,10 +27,16 @@ export const GCM_TAG_LEN = 16;
 export const CHECKSUM_LEN = 16;
 
 /**
- * Optional byte between the one-byte header size and the BackupPrefix
- * protobuf. `msgstore.db.crypt15` carries it; WhatsApp's other crypt15 files
- * (wa.db, backup_settings.json, …) do not. A protobuf can never start with it
- * (it would be field 0), so its presence is unambiguous.
+ * Upper bound on the BackupPrefix protobuf header. Real headers are a few
+ * hundred bytes at most; anything past this is a corrupt or hostile file,
+ * not a legitimate crypt15 variant — reject before allocating.
+ */
+export const MAX_HEADER_LEN = 4096;
+
+/**
+ * Optional byte some backups carry between the varint header size and the
+ * BackupPrefix protobuf. A protobuf can never start with it (it would be
+ * field 0), so its presence is unambiguous.
  */
 export const MSGSTORE_FEATURES_FLAG = 0x01;
 
@@ -61,10 +67,9 @@ export const ROOT_KEY_HEX_LEN = 64;
  * WhatsApp Android `message.message_type` (modern schema) /
  * `messages.media_wa_type` (legacy schema) → our generic message `type`.
  *
- * Cross-referenced against two independent community decoders
- * (ElDavoo/wa-crypt-tools, KnugiHK/WhatsApp-Chat-Exporter) but NOT verified
- * against every WhatsApp Android release — treat as best-effort, like the
- * iOS table's own documented gaps. Unknown codes fall back to media-shape
+ * Cross-referenced against community decoders (KnugiHK/WhatsApp-Chat-Exporter,
+ * ALEAPP's WhatsApp parser) but NOT verified against every WhatsApp Android
+ * release — treat as best-effort, like the iOS table's own documented gaps. Unknown codes fall back to media-shape
  * inference, then `unknown:<n>` (see msgstore-parser.ts's `inferType`).
  */
 export const MESSAGE_TYPE_BY_CODE: Record<number, string> = {
@@ -74,8 +79,8 @@ export const MESSAGE_TYPE_BY_CODE: Record<number, string> = {
   3: "video",
   4: "contact",
   5: "location",
-  6: "system",
-  8: "document",
+  7: "system",
+  9: "document",
   13: "gif",
   15: "deleted",
   20: "sticker",

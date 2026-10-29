@@ -50,6 +50,17 @@ describe.each(["modern", "legacy"] as const)("parseMsgstore — %s schema", (sch
           media: { filePath: "Media/x/report.pdf", mimeType: "application/pdf" },
         },
         { id: 4, keyId: "T4", chatId: 1, fromMe: 0, tsMs: 1_700_000_003_000, type: 15, text: "" },
+        {
+          id: 5,
+          keyId: "T5",
+          chatId: 1,
+          fromMe: 0,
+          tsMs: 1_700_000_004_000,
+          type: 9,
+          text: "",
+          media: { filePath: "Media/x/budget.pdf", mimeType: "application/pdf" },
+        },
+        { id: 6, keyId: "T6", chatId: 1, fromMe: 0, tsMs: 1_700_000_005_000, type: 7, text: "" },
       ],
     });
 
@@ -62,6 +73,8 @@ describe.each(["modern", "legacy"] as const)("parseMsgstore — %s schema", (sch
     const m4 = messages.find((m) => m.id === "T4")!;
     expect(m4.type).toBe("deleted");
     expect(m4.deleted).toBe(true);
+    expect(messages.find((m) => m.id === "T5")?.type).toBe("document");
+    expect(messages.find((m) => m.id === "T6")?.type).toBe("system");
   });
 
   it("resolves 1:1 and group senders", () => {
@@ -127,6 +140,52 @@ describe.each(["modern", "legacy"] as const)("parseMsgstore — %s schema", (sch
     });
     const reply = messages.find((m) => m.id === "R2")!;
     expect(reply.quotedText).toBe("original");
+    // The quote row's own id is 1, the same as the original message's: only
+    // the reply carries it.
+    expect(messages.find((m) => m.id === "R1")!.quotedText).toBeUndefined();
+  });
+
+  it("attaches a media row to its own message, not one sharing its row id", () => {
+    const { messages } = parse({
+      chats: [{ id: 1, jid: CHAT }],
+      messages: [
+        { id: 1, keyId: "J1", chatId: 1, fromMe: 0, tsMs: 1_700_000_000_000, type: 0, text: "hi" },
+        {
+          id: 2,
+          keyId: "J2",
+          chatId: 1,
+          fromMe: 0,
+          tsMs: 1_700_000_001_000,
+          type: 1,
+          text: "",
+          media: { filePath: "Media/x/photo.jpg", mimeType: "image/jpeg", fileSize: 999 },
+        },
+      ],
+    });
+    expect(messages.find((m) => m.id === "J1")!.media).toBeUndefined();
+    expect(messages.find((m) => m.id === "J2")!.media?.filename).toBe("photo.jpg");
+  });
+
+  it("imports a media caption as the message text", () => {
+    const { messages } = parse({
+      chats: [{ id: 1, jid: CHAT }],
+      messages: [
+        {
+          id: 1,
+          keyId: "C1",
+          chatId: 1,
+          fromMe: 0,
+          tsMs: 1_700_000_000_000,
+          type: 1,
+          text: null,
+          caption: "harbour at dawn",
+          media: { filePath: "Media/x/photo.jpg", mimeType: "image/jpeg" },
+        },
+        { id: 2, keyId: "C2", chatId: 1, fromMe: 0, tsMs: 1_700_000_001_000, type: 0, text: "hi" },
+      ],
+    });
+    expect(messages.find((m) => m.id === "C1")!.text).toBe("harbour at dawn");
+    expect(messages.find((m) => m.id === "C2")!.text).toBe("hi");
   });
 
   it("never sets downloadable-media fields (metadata-only attachments)", () => {

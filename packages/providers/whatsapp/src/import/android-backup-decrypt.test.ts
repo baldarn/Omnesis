@@ -94,18 +94,36 @@ describe("Android crypt15 decrypt", () => {
     expect(decryptMsgstore(filePath, keyHex).equals(msgstoreBytes)).toBe(true);
   });
 
-  it("reads the header size as one byte, flagged or not, past 127 bytes", () => {
-    const msgstoreBytes = buildMsgstoreDb(CORPUS);
-    for (const featuresFlag of [true, false]) {
-      const { filePath, keyHex } = makeEncryptedAndroidBackup({
-        msgstoreBytes,
-        featuresFlag,
-        headerPaddingBytes: 150,
-      });
-      pushFileDir(filePath);
-      expect(readFileSync(filePath)[0]).toBeGreaterThan(127);
-      expect(decryptMsgstore(filePath, keyHex).equals(msgstoreBytes)).toBe(true);
-    }
+  it.each([150, 300, 600])(
+    "reads a %i-byte padded header's size as a varint, flagged or not",
+    (headerPaddingBytes) => {
+      const msgstoreBytes = buildMsgstoreDb(CORPUS);
+      for (const featuresFlag of [true, false]) {
+        const { filePath, keyHex } = makeEncryptedAndroidBackup({
+          msgstoreBytes,
+          featuresFlag,
+          headerPaddingBytes,
+        });
+        pushFileDir(filePath);
+        expect(readFileSync(filePath)[0] & 0x80).toBe(0x80); // a multi-byte varint
+        expect(decryptMsgstore(filePath, keyHex).equals(msgstoreBytes)).toBe(true);
+      }
+    },
+  );
+
+  it("rejects a header length that exceeds the safety limit", () => {
+    const { filePath, keyHex } = makeEncryptedAndroidBackup({
+      msgstoreBytes: buildMsgstoreDb(CORPUS),
+    });
+    pushFileDir(filePath);
+    const original = readFileSync(filePath);
+    // Replace the leading one-byte varint with an implausibly large header length.
+    const tampered = Buffer.concat([
+      Buffer.from([0xff, 0xff, 0xff, 0xff, 0x0f]),
+      original.subarray(1),
+    ]);
+    writeFileSync(filePath, tampered);
+    expect(() => decryptMsgstore(filePath, keyHex)).toThrow(UnsupportedBackupFormatError);
   });
 
   it("checks the trailing MD5 over the header too", () => {

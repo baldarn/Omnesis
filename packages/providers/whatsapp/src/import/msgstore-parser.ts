@@ -18,10 +18,14 @@ import type { StoredMessage } from "../types.js";
  * each generation's query tolerates its own optional-column drift the same
  * way `chatstorage-parser.ts` does for iOS, via `PRAGMA table_info`.
  *
- * Both generations denormalize a reply's quoted content inline (a satellite
- * row keyed by the replying message's own row id), so — unlike the iOS
- * parser — no first-pass index is needed to resolve quotes, which is what
- * lets this parser stream rather than materialize.
+ * Both generations denormalize a reply's quoted content inline in a
+ * satellite row — modern `message_quoted.message_row_id` is the replying
+ * message's row id, legacy `messages.quoted_row_id` points at the
+ * `messages_quotes` row — so, unlike the iOS parser, no first-pass index is
+ * needed to resolve quotes, which is what lets this parser stream rather than
+ * materialize. Media rows hang off `message_media.message_row_id` in both.
+ * Satellite tables number their own `_id`s, so a join on `_id` would attach
+ * an unrelated row.
  *
  * Schema reference: cross-checked against two independent community
  * decoders (ElDavoo/wa-crypt-tools, KnugiHK/WhatsApp-Chat-Exporter), not an
@@ -163,10 +167,17 @@ function toRow(r: CommonRow, own: { jid: string; name: string }): StoredMessage 
 
 function buildLegacyQuery(db: Database.Database): string {
   const m = columnsOf(db, "messages");
-  const hasQuotes = tableNames(db).has("messages_quotes");
+  const hasQuotes = tableNames(db).has("messages_quotes") && m.has("quoted_row_id");
   const mq = hasQuotes ? columnsOf(db, "messages_quotes") : new Set<string>();
-  const hasMedia = tableNames(db).has("message_media");
-  const mm = hasMedia ? columnsOf(db, "message_media") : new Set<string>();
+  const mm = tableNames(db).has("message_media")
+    ? columnsOf(db, "message_media")
+    : new Set<string>();
+  const hasMedia = mm.has("message_row_id");
+  // A media row's caption lives in `media_caption`; `data` is empty on it.
+  const data = m.has("data") ? "m.data" : "NULL";
+  const text = m.has("media_caption")
+    ? `COALESCE(NULLIF(${data}, ''), m.media_caption, ${data})`
+    : data;
 
   return `
     SELECT
@@ -176,7 +187,7 @@ function buildLegacyQuery(db: Database.Database): string {
       ${pick(true, m, "m", "key_from_me", "from_me")},
       CAST(${m.has("timestamp") ? "m.timestamp" : "NULL"} AS INTEGER) AS ts_ms,
       ${pick(true, m, "m", "media_wa_type", "msg_type")},
-      ${pick(true, m, "m", "data", "text")},
+      ${text} AS text,
       ${pick(true, m, "m", "remote_resource", "sender_jid")},
       ${pick(hasQuotes, mq, "mq", "key_id", "quoted_key_id")},
       ${pick(hasQuotes, mq, "mq", "data", "quoted_text")},
@@ -187,8 +198,8 @@ function buildLegacyQuery(db: Database.Database): string {
       ${pick(true, m, "m", "latitude", "lat")},
       ${pick(true, m, "m", "longitude", "lon")}
     FROM messages m
-      ${hasQuotes ? "LEFT JOIN messages_quotes mq ON mq._id = m._id" : ""}
-      ${hasMedia ? "LEFT JOIN message_media mm ON mm._id = m._id" : ""}
+      ${hasQuotes ? "LEFT JOIN messages_quotes mq ON mq._id = m.quoted_row_id" : ""}
+      ${hasMedia ? "LEFT JOIN message_media mm ON mm.message_row_id = m._id" : ""}
     ORDER BY m.timestamp ASC
   `;
 }
