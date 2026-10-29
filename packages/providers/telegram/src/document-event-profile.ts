@@ -69,7 +69,7 @@ export const telegramDocumentEventProfile: DocumentEventProfile = {
       type: "string-array",
       identifiesPeople: true,
       description:
-        "Display name of everyone who spoke that day; the account holder appears as 'You'.",
+        "Display name of everyone in the conversation that day, including the other side of a private chat; the account holder always appears as 'You'.",
     },
     {
       path: "extra.messageCount",
