@@ -562,6 +562,11 @@
           <code>omnesis sources reauth telegram:&lt;account&gt;</code> and scan a new code. One
           collector hosts an account: the session cannot be shared between machines.
         </p>
+        <p>
+          <strong>The session is your whole account.</strong> The stored session is a full
+          authorization of your Telegram account: anyone holding it can read your chats and act as
+          you. The collector stores it encrypted, protected by its keyring.
+        </p>
         <ul>
           <li>
             <strong>What it archives.</strong> Private chats, Saved Messages, basic groups,
@@ -604,17 +609,30 @@
           <li>
             <strong>Its archive.</strong> Messages are kept in an archive in the collector's
             configuration directory, encrypted with the collector's storage key, so a re-sync never
-            reads Telegram again. Removing the source deletes it.
+            reads Telegram again. Removing the source deletes the archive and ends the source's
+            Telegram session: the collector logs that authorization out at Telegram, best effort, so
+            it leaves your device list.
           </li>
         </ul>
         <p>
-          <strong>Telegram's API terms.</strong> Telegram's terms for API apps forbid using data
-          obtained through the API to train, fine-tune, or otherwise engage in the development,
-          enhancement or deployment of artificial intelligence models. Omnesis indexes the archive
-          locally and its agents can answer from it; decide whether that use fits your reading of
-          the terms before connecting the source. Accounts that behave like unofficial clients can
-          also be limited by Telegram; the source paces its requests, and backs off when Telegram
-          asks.
+          <strong>Telegram's terms.</strong> Two Telegram documents bear on this source. The
+          <a href="https://core.telegram.org/api/terms">Telegram API Terms of Service</a>, §1.5,
+          prohibit using, accessing or aggregating data obtained from the platform to train,
+          fine-tune or otherwise engage in the development, enhancement or deployment of artificial
+          intelligence, machine learning models and similar technologies. The
+          <a href="https://telegram.org/tos/content-licensing"
+            >Terms of Service for Content Licensing</a
+          >, under <em>Large Language Models and AI</em>, prohibit the scraping, indexing,
+          harvesting, aggregation or use of data obtained from the platform for those purposes, and
+          permit access to the data a legitimate third-party client needs to operate. Omnesis
+          indexes the archive locally and its agents can answer from it. Whether that use fits your
+          reading of these terms is your decision; make it before connecting the source.
+        </p>
+        <p>
+          <strong>Unofficial clients.</strong> Telegram states that accounts that log in through
+          unofficial API clients are automatically put under observation, and it can limit or ban an
+          account it judges to be breaking its terms. Omnesis signs in as such a client. The source
+          paces its requests and backs off when Telegram asks.
         </p>
 
         <h2 id="notes-tasks-meetings">Notes, tasks &amp; meetings</h2>
