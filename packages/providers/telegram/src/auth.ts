@@ -16,7 +16,12 @@
 
 import { CredentialPersistError, createLogger, toErrorMessage } from "@omnesis/core";
 import { AuthFailure, config, type AuthResult, type AuthSession } from "@omnesis/source-sdk";
-import { TELEGRAM_FILE_KEY, loadAppCredentials } from "./credentials-spec.js";
+import {
+  TELEGRAM_API_TERMS_URL,
+  TELEGRAM_FILE_KEY,
+  TELEGRAM_TERMS_URL,
+  loadAppCredentials,
+} from "./credentials-spec.js";
 import { telegramDeviceInfo } from "./device.js";
 import { isAppCredentialRejected } from "./client/errors.js";
 import { LOGIN_TIMEOUT_MS, LOGOUT_TIMEOUT_MS, MAX_PASSWORD_ATTEMPTS } from "./limits.js";
@@ -73,7 +78,9 @@ export async function loginFlow(session: AuthSession, deps: LoginDeps): Promise<
             kind: "qr",
             title: "Scan this code with Telegram",
             instructions:
-              "On your phone: Telegram → Settings → Devices → Link Desktop Device, then scan.",
+              "On your phone: Telegram → Settings → Devices → Link Desktop Device, then scan. " +
+              `Using this source is subject to Telegram's terms (${TELEGRAM_TERMS_URL} and ` +
+              `${TELEGRAM_API_TERMS_URL}), which are yours to read and follow.`,
             data: url,
             expiresAt: expires.toISOString(),
           }),

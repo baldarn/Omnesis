@@ -12,6 +12,10 @@ const TELEGRAM_PROVIDER_NAME = "Telegram";
 const API_ID_PATTERN = "^\\d+$";
 const API_HASH_PATTERN = "^[0-9a-f]{32}$";
 
+/** Telegram's own terms pages, linked rather than restated so they never drift. */
+export const TELEGRAM_TERMS_URL = "https://telegram.org/tos";
+export const TELEGRAM_API_TERMS_URL = "https://core.telegram.org/api/terms";
+
 /**
  * The operator's own Telegram API app.
  *
@@ -52,6 +56,15 @@ export const telegramCredentialsSpec: ProviderCredentialsSpec = {
       "stays on this machine and is never shared; only requests this host makes reach Telegram.",
     estMinutes: 5,
     steps: [
+      {
+        kind: "open-url",
+        title: "Read Telegram's terms",
+        body:
+          "Using this source is subject to the Telegram Terms of Service and the Telegram API " +
+          `Terms of Service (${TELEGRAM_API_TERMS_URL}). It is your responsibility to read ` +
+          "them and to follow them while you use this source.",
+        url: TELEGRAM_TERMS_URL,
+      },
       {
         kind: "open-url",
         title: "Sign in at my.telegram.org",

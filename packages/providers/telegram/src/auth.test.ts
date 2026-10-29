@@ -56,6 +56,9 @@ describe("Telegram sign-in", () => {
       expect(qr.data).toMatch(/^tg:\/\/login\?token=/u);
       expect(Date.parse(qr.expiresAt!)).toBeGreaterThan(Date.now());
       expect(qr.title).toBe("Scan this code with Telegram");
+      // Every sign-in points at Telegram's terms instead of restating them.
+      expect(qr.instructions).toContain("https://telegram.org/tos");
+      expect(qr.instructions).toContain("https://core.telegram.org/api/terms");
     }
     sim.qr.scan(SELF.id);
     await expect(flow).resolves.toMatchObject({

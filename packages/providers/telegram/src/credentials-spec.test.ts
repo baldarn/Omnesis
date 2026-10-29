@@ -43,7 +43,10 @@ describe("telegramCredentialsSpec", () => {
     expect(wizard.why.length).toBeGreaterThan(0);
     expect(wizard.estMinutes).toBe(5);
     expect(wizard.steps.length).toBeGreaterThanOrEqual(4);
-    expect(wizard.steps[0]).toMatchObject({
+    // The wizard opens on Telegram's terms, linked rather than restated.
+    expect(wizard.steps[0]).toMatchObject({ kind: "open-url", url: "https://telegram.org/tos" });
+    expect(wizard.steps[0]!.body).toContain("https://core.telegram.org/api/terms");
+    expect(wizard.steps[1]).toMatchObject({
       kind: "open-url",
       url: "https://my.telegram.org/apps",
     });
