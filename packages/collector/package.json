@@ -18,6 +18,7 @@
     "@omnesis/provider-claude-code": "*",
     "@omnesis/provider-codex": "*",
     "@omnesis/provider-coinbase": "*",
+    "@omnesis/provider-discord": "*",
     "@omnesis/provider-enable-banking": "*",
     "@omnesis/provider-github": "*",
     "@omnesis/provider-google": "*",

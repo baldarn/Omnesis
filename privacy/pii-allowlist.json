@@ -1762,7 +1762,7 @@
   "phones": [
     {
       "value": "099.246.1981",
-      "paths": ["website/media/discord.svg"],
+      "paths": ["website/media/discord.svg", "packages/providers/discord/src/icons.ts"],
       "reason": "Adjacent SVG path coordinates from the Simple Icons Discord mark, not a phone number."
     },
     {
@@ -2713,7 +2713,8 @@
         "evals/universes/sacha-bellamy/cast.json",
         "evals/universes/sacha-bellamy/sources/apple-imessage/messages.json",
         "evals/universes/sacha-bellamy/sources/granola-meetings/meetings.json",
-        "evals/universes/sacha-bellamy/sources/whatsapp-messages/messages.json"
+        "evals/universes/sacha-bellamy/sources/whatsapp-messages/messages.json",
+        "packages/providers/discord/src/normalizer.test.ts"
       ],
       "reason": "Reviewed deterministic output of the original fictional universe authoring modules; fictional cast/venue/product or public title-case prose, never personal corpus data."
     },
@@ -2823,7 +2824,9 @@
       "value": "Maya Reeves",
       "paths": [
         "evals/universes/sacha-bellamy/sources/gmail/messages.json",
-        "evals/universes/sacha-bellamy/sources/google-drive/files.json"
+        "evals/universes/sacha-bellamy/sources/google-drive/files.json",
+        "packages/providers/discord/src/normalizer.test.ts",
+        "packages/providers/discord/src/source.test.ts"
       ],
       "reason": "Reviewed deterministic output of the original fictional universe authoring modules; fictional cast/venue/product or public title-case prose, never personal corpus data."
     },
@@ -3274,7 +3277,9 @@
       "value": "David Lin",
       "paths": [
         "packages/providers-synth/apple/src/fixtures.test.ts",
-        "packages/providers-synth/whatsapp/src/fixtures.test.ts"
+        "packages/providers-synth/whatsapp/src/fixtures.test.ts",
+        "packages/providers/discord/src/normalizer.test.ts",
+        "packages/providers/discord/src/source.test.ts"
       ],
       "reason": "Reviewed original fictional demo cast, invented venue/product, or public title-case prose in the named authoring module/test; no personal-corpus provenance."
     },
@@ -10062,7 +10067,8 @@
         "packages/source-sdk/src/record-citation.test.ts",
         "packages/watch/src/runtime/update-storm.test.ts",
         "packages/watch/universes/poc/events.json",
-        "packages/watch/universes/poc/watches/alice-declines-dinner.json"
+        "packages/watch/universes/poc/watches/alice-declines-dinner.json",
+        "packages/providers/discord/src/source.test.ts"
       ],
       "reason": "reviewed existing fixture"
     },
@@ -12198,6 +12204,49 @@
       "value": "Expected Failure",
       "paths": ["scripts/ci/verify-ios-e2e-results.test.mjs"],
       "reason": "Public xcresulttool TestResult enum value, not a person's name."
+    },
+    {
+      "value": "User-Agent Discord",
+      "paths": ["packages/providers/discord/src/client.test.ts"],
+      "reason": "reviewed: invented Discord fixture (CLAUDE.md example names and made-up servers; Discord permission and header labels, not people)"
+    },
+    {
+      "value": "Read Message History",
+      "paths": [
+        "packages/providers/discord/src/client.test.ts",
+        "packages/providers/discord/src/source.test.ts"
+      ],
+      "reason": "reviewed: invented Discord fixture (CLAUDE.md example names and made-up servers; Discord permission and header labels, not people)"
+    },
+    {
+      "value": "Northstar Labs",
+      "paths": [
+        "packages/providers/discord/src/document-event-profile.test.ts",
+        "packages/providers/discord/src/normalizer.test.ts",
+        "packages/providers/discord/src/source.test.ts",
+        "packages/providers/discord/src/sync-cycle.test.ts"
+      ],
+      "reason": "reviewed: invented Discord fixture (CLAUDE.md example names and made-up servers; Discord permission and header labels, not people)"
+    },
+    {
+      "value": "Developer Portal",
+      "paths": ["packages/providers/discord/src/provider.test.ts"],
+      "reason": "reviewed: invented Discord fixture (CLAUDE.md example names and made-up servers; Discord permission and header labels, not people)"
+    },
+    {
+      "value": "View Channels",
+      "paths": ["packages/providers/discord/src/source.test.ts"],
+      "reason": "reviewed: invented Discord fixture (CLAUDE.md example names and made-up servers; Discord permission and header labels, not people)"
+    },
+    {
+      "value": "Message Content",
+      "paths": ["packages/providers/discord/src/source.test.ts"],
+      "reason": "reviewed: invented Discord fixture (CLAUDE.md example names and made-up servers; Discord permission and header labels, not people)"
+    },
+    {
+      "value": "Message Content Intent",
+      "paths": ["packages/providers/discord/src/source.test.ts"],
+      "reason": "reviewed: invented Discord fixture (CLAUDE.md example names and made-up servers; Discord permission and header labels, not people)"
     }
   ],
   "secretFixtures": [

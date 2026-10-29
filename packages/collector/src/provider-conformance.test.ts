@@ -89,6 +89,20 @@ const current: Record<string, unknown> = {
     affectedDates: ["2026-01-02"],
   },
   "chrome-bookmarks": { fileChecksum: "checksum", knownIds: ["bookmark-1"] },
+  discord: {
+    v: 1,
+    channels: { "100": { lastId: "500", lastDay: "2026-01-02", lastHash: "hash" } },
+    queue: [
+      {
+        id: "100",
+        guildId: "10",
+        guildName: "Server",
+        name: "channel",
+        kind: "text",
+      },
+    ],
+    cycle: { readable: 1, unreadable: 0 },
+  },
   "enable-banking-accounts": {
     phase: "incremental",
     accountIndex: 1,

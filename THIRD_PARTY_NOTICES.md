@@ -293,6 +293,12 @@ descriptor at `packages/providers/hermes/src/icons.ts`, is rendered from the
 > The marks themselves remain the property of their respective owners; see
 > `TRADEMARKS.md`.
 
+The Discord source bundles the path data of the `discord` glyph from
+[Simple Icons](https://simpleicons.org) (`packages/providers/discord/src/icons.ts`).
+Simple Icons releases its icon files under CC0-1.0
+(<https://github.com/simple-icons/simple-icons/blob/develop/LICENSE.md>); the mark
+itself remains Discord Inc.'s, see `TRADEMARKS.md`.
+
 ---
 
 ## 4. Browser-extension libraries

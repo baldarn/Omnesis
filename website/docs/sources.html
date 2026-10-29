@@ -298,9 +298,78 @@
                   counts the clips still waiting.
                 </td>
               </tr>
+              <tr>
+                <td>
+                  Discord<br /><span class="pill">any collector</span>
+                  <span class="pill">Bot token</span> <span class="pill">Experimental</span>
+                </td>
+                <td>
+                  Each channel's day as one conversation document, across the servers a bot of yours
+                  belongs to, threads and forum posts included; posters feed the people graph.
+                  Offered only when the Gateway runs with
+                  <code>OMNESIS_EXPERIMENTAL=1</code> — see <a href="#discord">Discord</a>.
+                </td>
+              </tr>
             </tbody>
           </table>
         </div>
+
+        <h3 id="discord">Discord</h3>
+        <p>
+          Discord is <strong>experimental</strong>: it appears in the source picker only when the
+          Gateway runs with <code>OMNESIS_EXPERIMENTAL=1</code>, and its behavior may change between
+          releases.
+        </p>
+        <p>
+          Discord hands message history to bots only — an ordinary account may not be automated, and
+          no OAuth2 scope reads messages. So you create an application in Discord's Developer
+          Portal, give it a bot, enable the <strong>Message Content Intent</strong> on its Bot page,
+          and paste the bot token. Omnesis then builds the invite link itself, asking for
+          <strong>View Channels</strong> and <strong>Read Message History</strong> and nothing else;
+          open it and add the bot to each server you want indexed. Until the bot is in a server, the
+          source reports that it is in none and shows the link.
+        </p>
+        <div class="term">
+          <div class="term-bar"><span></span><span></span><span></span></div>
+          <div class="term-body">
+            <p>
+              <span class="t-prompt">❯</span>
+              <span class="t-cmd">omnesis sources add discord</span>
+            </p>
+          </div>
+        </div>
+        <ul>
+          <li>
+            <strong>What the bot sees is what gets indexed.</strong> Only servers the bot was
+            invited to, and only channels it may view; deny it View Channel on a channel to keep
+            that channel out. Private threads and direct messages are never read. The
+            <code>guilds</code> setting narrows the indexed servers further by id.
+          </li>
+          <li>
+            <strong>One bot per server.</strong> Each Discord source indexes what its own bot sees.
+            Two sources whose bots share a server index that server twice; give each bot its own
+            servers, or name them in <code>guilds</code>.
+          </li>
+          <li>
+            <strong>Your own messages.</strong> The bot is not you, so set the
+            <code>selfUserId</code> setting to your Discord user id and your messages resolve to the
+            self person. Other posters are people keyed by their Discord id.
+          </li>
+          <li>
+            <strong>History and freshness.</strong> The first sync walks each channel from the
+            beginning, or from the data cutoff when one is set. Later syncs re-read each channel's
+            last indexed day, so an edit or a deletion there lands; an older day is never re-read,
+            and a channel that disappears keeps its documents.
+          </li>
+          <li>
+            <strong>Limits.</strong> An app visible to fewer than 10,000 users may turn the Message
+            Content Intent on without review; past that Discord requires an intent review, and
+            withdraws unreviewed access. Discord does not refuse a bot whose intent is off — it
+            blanks every message body instead — so a sync that sees a long run of empty messages
+            stops and names the intent rather than indexing nothing. The source honors Discord's
+            rate limits and pauses for as long as Discord asks.
+          </li>
+        </ul>
 
         <h3 id="maildir">Maildir</h3>
         <p>
