@@ -40,11 +40,24 @@ function encodeLengthDelimited(fieldNumber: number, data: Buffer): Buffer {
   return Buffer.concat([tag, encodeVarint(data.length), data]);
 }
 
-/** Builds the `[varint header_len][BackupPrefix protobuf]` header carrying `iv`. */
-function buildCrypt15Header(iv: Buffer): Buffer {
+/**
+ * Builds the `[1-byte header_len][optional features flag][BackupPrefix protobuf]`
+ * header carrying `iv`. `paddingBytes` adds an unrelated length-delimited
+ * field, as real headers carry (app version, feature bits), so a test can
+ * reach a 128+ byte header.
+ */
+function buildCrypt15Header(iv: Buffer, featuresFlag: boolean, paddingBytes: number): Buffer {
   const c15iv = encodeLengthDelimited(1, iv); // C15IV.encryption_iv
-  const header = encodeLengthDelimited(3, c15iv); // BackupPrefix.e2ee_key_data
-  return Buffer.concat([encodeVarint(header.length), header]);
+  const header = Buffer.concat([
+    encodeLengthDelimited(3, c15iv), // BackupPrefix.e2ee_key_data
+    ...(paddingBytes > 0 ? [encodeLengthDelimited(5, Buffer.alloc(paddingBytes, 0x61))] : []),
+  ]);
+  if (header.length > 0xff) throw new Error(`crypt15 header too long: ${header.length}`);
+  return Buffer.concat([
+    Buffer.from([header.length]),
+    ...(featuresFlag ? [Buffer.from([0x01])] : []),
+    header,
+  ]);
 }
 
 // ───────────────────────────── msgstore.db corpus ──────────────────────────────
@@ -218,9 +231,14 @@ export function buildMsgstoreDb(
 /**
  * Build a crypt15-encrypted Android backup file whose decrypted contents are
  * `msgstoreBytes`. Returns the file path and the 64-hex root key that
- * decrypts it (what `resolveRootKey`/`deriveAesKey` expect).
+ * decrypts it (what `resolveRootKey`/`deriveAesKey` expect). By default the
+ * header carries the features flag, as `msgstore.db.crypt15` does.
  */
-export function makeEncryptedAndroidBackup(opts: { msgstoreBytes: Buffer }): {
+export function makeEncryptedAndroidBackup(opts: {
+  msgstoreBytes: Buffer;
+  featuresFlag?: boolean;
+  headerPaddingBytes?: number;
+}): {
   filePath: string;
   keyHex: string;
 } {
@@ -232,12 +250,11 @@ export function makeEncryptedAndroidBackup(opts: { msgstoreBytes: Buffer }): {
   const cipher = createCipheriv("aes-256-gcm", aesKey, iv);
   const ciphertext = Buffer.concat([cipher.update(compressed), cipher.final()]);
   const tag = cipher.getAuthTag();
-  const checksum = createHash("md5")
-    .update(Buffer.concat([ciphertext, tag]))
-    .digest();
 
-  const header = buildCrypt15Header(iv);
-  const fileBytes = Buffer.concat([header, ciphertext, tag, checksum]);
+  const header = buildCrypt15Header(iv, opts.featuresFlag ?? true, opts.headerPaddingBytes ?? 0);
+  const body = Buffer.concat([header, ciphertext, tag]);
+  const checksum = createHash("md5").update(body).digest();
+  const fileBytes = Buffer.concat([body, checksum]);
 
   const dir = mkdtempSync(join(tmpdir(), "omnesis-wa-android-backup-"));
   const filePath = join(dir, "msgstore.db.crypt15");

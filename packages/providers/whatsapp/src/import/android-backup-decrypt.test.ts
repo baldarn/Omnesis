@@ -86,17 +86,47 @@ describe("Android crypt15 decrypt", () => {
     expect(() => decryptMsgstore(filePath, wrongKey)).toThrow(WrongBackupKeyError);
   });
 
-  it("rejects a header length that exceeds the safety limit", () => {
+  it("decrypts a header without the features flag, as WhatsApp's non-msgstore files carry", () => {
+    const msgstoreBytes = buildMsgstoreDb(CORPUS);
+    const { filePath, keyHex } = makeEncryptedAndroidBackup({ msgstoreBytes, featuresFlag: false });
+    pushFileDir(filePath);
+    expect(readFileSync(filePath)[1]).not.toBe(0x01);
+    expect(decryptMsgstore(filePath, keyHex).equals(msgstoreBytes)).toBe(true);
+  });
+
+  it("reads the header size as one byte, flagged or not, past 127 bytes", () => {
+    const msgstoreBytes = buildMsgstoreDb(CORPUS);
+    for (const featuresFlag of [true, false]) {
+      const { filePath, keyHex } = makeEncryptedAndroidBackup({
+        msgstoreBytes,
+        featuresFlag,
+        headerPaddingBytes: 150,
+      });
+      pushFileDir(filePath);
+      expect(readFileSync(filePath)[0]).toBeGreaterThan(127);
+      expect(decryptMsgstore(filePath, keyHex).equals(msgstoreBytes)).toBe(true);
+    }
+  });
+
+  it("checks the trailing MD5 over the header too", () => {
+    const { filePath, keyHex } = makeEncryptedAndroidBackup({
+      msgstoreBytes: buildMsgstoreDb(CORPUS),
+      headerPaddingBytes: 8,
+    });
+    pushFileDir(filePath);
+    const tampered = Buffer.from(readFileSync(filePath));
+    tampered[tampered.indexOf(Buffer.from("aaaaaaaa"))] ^= 0x01; // a header byte no parse reads
+    writeFileSync(filePath, tampered);
+    expect(() => decryptMsgstore(filePath, keyHex)).toThrow(UnsupportedBackupFormatError);
+  });
+
+  it("rejects a zero header length", () => {
     const { filePath, keyHex } = makeEncryptedAndroidBackup({
       msgstoreBytes: buildMsgstoreDb(CORPUS),
     });
     pushFileDir(filePath);
-    const original = readFileSync(filePath);
-    // Overwrite the leading varint with an implausibly large header length.
-    const tampered = Buffer.concat([
-      Buffer.from([0xff, 0xff, 0xff, 0xff, 0x0f]),
-      original.subarray(1),
-    ]);
+    const tampered = Buffer.from(readFileSync(filePath));
+    tampered[0] = 0;
     writeFileSync(filePath, tampered);
     expect(() => decryptMsgstore(filePath, keyHex)).toThrow(UnsupportedBackupFormatError);
   });

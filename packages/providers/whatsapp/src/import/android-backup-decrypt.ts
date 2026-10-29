@@ -12,7 +12,7 @@ import {
   GCM_IV_LEN,
   GCM_TAG_LEN,
   MAX_DECOMPRESSED_BYTES,
-  MAX_HEADER_LEN,
+  MSGSTORE_FEATURES_FLAG,
   ROOT_KEY_HEX_LEN,
   ROOT_KEY_LEN,
   ZERO_SEED_32,
@@ -26,9 +26,9 @@ import {
  * here alone (see the importer's risk notes).
  *
  * Container (single-file local-backup layout only):
- *   [varint header_len][header_len bytes: BackupPrefix protobuf, carries the GCM IV]
+ *   [1-byte header_len][optional 0x01 features flag][header_len bytes: BackupPrefix protobuf, carries the GCM IV]
  *   [ciphertext = AES-256-GCM(zlib(msgstore.db))]
- *   [16-byte GCM auth tag][16-byte MD5(ciphertext||tag) — plain integrity checksum]
+ *   [16-byte GCM auth tag][16-byte MD5(every preceding byte) — plain integrity checksum]
  *
  * Key derivation (encryptionloop): privateKey = HMAC-SHA256(zero32, rootKey);
  * aesKey = HMAC-SHA256(privateKey, "backup encryption" + 0x01).
@@ -183,16 +183,22 @@ function findField(buf: Buffer, fieldNumber: number, wireType: number): ProtoFie
 export interface Crypt15Header {
   /** 16-byte GCM IV, from BackupPrefix.e2ee_key_data.encryption_iv. */
   iv: Buffer;
-  /** Total bytes consumed by the length prefix + header body — ciphertext starts here. */
+  /** Total bytes consumed by the size byte, the optional flag and the header body — ciphertext starts here. */
   headerLen: number;
 }
 
-/** Parses the leading `[varint len][BackupPrefix protobuf]` header of a crypt15 file. */
+/**
+ * Parses the leading `[1-byte len][optional features flag][BackupPrefix protobuf]`
+ * header of a crypt15 file. The size is a single byte, not a varint: a
+ * flagged header of 128+ bytes reads the same either way, which is why a
+ * varint reader only appears to work on `msgstore.db.crypt15`.
+ */
 export function parseCrypt15Header(buf: Buffer): Crypt15Header {
-  const [declaredLen, bodyStart] = readVarint(buf, 0);
-  if (declaredLen <= 0 || declaredLen > MAX_HEADER_LEN) {
-    throw new UnsupportedBackupFormatError("Backup header length is missing or implausible.");
+  const declaredLen = buf[0];
+  if (!declaredLen) {
+    throw new UnsupportedBackupFormatError("Backup header length is missing.");
   }
+  const bodyStart = buf[1] === MSGSTORE_FEATURES_FLAG ? 2 : 1;
   const bodyEnd = bodyStart + declaredLen;
   if (bodyEnd > buf.length) {
     throw new CorruptBackupError(
@@ -250,11 +256,12 @@ export function decryptMsgstore(
   const tag = buf.subarray(trailerStart, trailerStart + GCM_TAG_LEN);
   const checksum = buf.subarray(trailerStart + GCM_TAG_LEN);
 
-  // This plain MD5 checksum (not part of the AEAD) is how the single-file local-backup
-  // layout is told apart from WhatsApp's chunked Google-Drive backup variant, which has
-  // no such trailer. It does not depend on the key, so this check runs before decryption.
+  // This plain MD5 checksum (not part of the AEAD) covers the whole file before it, header
+  // included, and is how the single-file local-backup layout is told apart from WhatsApp's
+  // chunked Google-Drive backup variant, which has no such trailer. It does not depend on
+  // the key, so this check runs before decryption.
   const expectedChecksum = createHash("md5")
-    .update(Buffer.concat([ciphertext, tag]))
+    .update(buf.subarray(0, trailerStart + GCM_TAG_LEN))
     .digest();
   if (!expectedChecksum.equals(checksum)) {
     throw new UnsupportedBackupFormatError(

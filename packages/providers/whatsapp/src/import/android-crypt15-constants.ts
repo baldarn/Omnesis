@@ -19,18 +19,20 @@ export const GCM_IV_LEN = 16;
 export const GCM_TAG_LEN = 16;
 
 /**
- * Trailing plain (non-AEAD) integrity checksum: MD5(ciphertext || tag).
- * Present only on the single-file local-backup layout; its absence/mismatch
- * is how we detect (and reject) the chunked Google-Drive backup variant.
+ * Trailing plain (non-AEAD) integrity checksum: MD5 of every byte before it
+ * (header, ciphertext and tag). Present only on the single-file local-backup
+ * layout; its absence/mismatch is how we detect (and reject) the chunked
+ * Google-Drive backup variant.
  */
 export const CHECKSUM_LEN = 16;
 
 /**
- * Upper bound on the BackupPrefix protobuf header. Real headers are a few
- * dozen bytes; anything past this is a corrupt or hostile file, not a
- * legitimate crypt15 variant — reject before allocating.
+ * Optional byte between the one-byte header size and the BackupPrefix
+ * protobuf. `msgstore.db.crypt15` carries it; WhatsApp's other crypt15 files
+ * (wa.db, backup_settings.json, …) do not. A protobuf can never start with it
+ * (it would be field 0), so its presence is unambiguous.
  */
-export const MAX_HEADER_LEN = 4096;
+export const MSGSTORE_FEATURES_FLAG = 0x01;
 
 /**
  * Upper bound on the decompressed msgstore.db size — guards a zlib
