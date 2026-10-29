@@ -98,7 +98,7 @@ describe("TelegramArchive storage", () => {
     }
     const reopened = openArchive();
     expect(reopened.storeId).toBe(id);
-    expect(reopened.getMeta("schema_version")).toBe("4");
+    expect(reopened.getMeta("schema_version")).toBe("5");
     reopened.close();
   });
 
@@ -224,6 +224,59 @@ describe("TelegramArchive writes and drain", () => {
     return first.days;
   }
 
+  it("never issues one emitSeq twice across two handles on the archive", () => {
+    live(chat, stored(chat, 1, T0, "Q4 budget review at ten"));
+    // A rebuilt context opens its handle while the old one is still open.
+    const second = TelegramArchive.open(dir, null, { now: () => clock });
+    try {
+      const a = archive.drain({ committedSeq: 0, limit: 10 });
+      const b = second.drain({ committedSeq: a.emitSeq, limit: 10 });
+      const c = archive.drain({ committedSeq: b.emitSeq, limit: 10 });
+      expect(b.emitSeq).toBe(a.emitSeq + 1);
+      expect(c.emitSeq).toBe(b.emitSeq + 1);
+      // `b` was a value this archive issued, so it acknowledged the day.
+      expect(archive.dirtyDayCount()).toBe(0);
+    } finally {
+      second.close();
+    }
+  });
+
+  it("holds back a day whose render failed, keeps it queued across acks, and retries it later", () => {
+    live(chat, stored(chat, 1, T0, "Q4 budget review at ten"));
+    live(chat, stored(chat, 2, T0 + 86_400, "Heart-rate trend for the week"));
+    const first = archive.drain({ committedSeq: 0, limit: 10 });
+    expect(first.days).toHaveLength(2);
+    expect(archive.quarantineDay(chat.id, "2026-03-10")).toBe(1);
+    // The page's acknowledgement clears the day that rendered, not the failed one.
+    const held = archive.drain({ committedSeq: first.emitSeq, limit: 10 });
+    expect(held).toMatchObject({ days: [], morePending: false });
+    expect(archive.dirtyDayCount()).toBe(1);
+    expect(archive.quarantinedDayCount()).toBe(1);
+    clock += 61;
+    const retried = archive.drain({ committedSeq: held.emitSeq, limit: 10 });
+    expect(retried.days.map((d) => d.date)).toEqual(["2026-03-10"]);
+    expect(archive.quarantineDay(chat.id, "2026-03-10")).toBe(2);
+    clock += 61;
+    // The second failure waits twice as long.
+    expect(archive.drain({ committedSeq: retried.emitSeq, limit: 10 }).days).toEqual([]);
+    clock += 60;
+    const third = archive.drain({ committedSeq: 0, limit: 10 });
+    expect(third.days).toHaveLength(1);
+    archive.drain({ committedSeq: third.emitSeq, limit: 10 });
+    expect(archive.quarantinedDayCount()).toBe(0);
+  });
+
+  it("dates a day's last change by edits, deletions and renamed topics, never by a first write", () => {
+    live(chat, stored(chat, 1, T0, "Q4 budget review at ten"));
+    expect(drainAll()[0]!.changedAt).toBeUndefined();
+    clock += 100;
+    live(chat, stored(chat, 1, T0, "Q4 budget review at eleven", { editTs: T0 + 50 }));
+    expect(drainAll()[0]!.changedAt).toBe(clock);
+    clock += 100;
+    archive.deleteMessages("common", [1]);
+    expect(drainAll()[0]!.changedAt).toBe(clock);
+  });
+
   it("marks a day dirty on an edit only when the edit is newer", () => {
     live(chat, stored(chat, 1, T0, "Q4 budget review at ten"));
     drainAll();
@@ -272,7 +325,10 @@ describe("TelegramArchive writes and drain", () => {
     drainAll();
     expect(archive.deleteMessages("common", [7])).toBe(1);
     const { days } = archive.drain({ committedSeq: 0, limit: 10 });
-    expect(days).toEqual([{ chatId: chat.id, date: "2026-03-10", messages: [], ledger: [] }]);
+    // The deletion is a change of the day: `sourceUpdatedAt` moves with it.
+    expect(days).toEqual([
+      { chatId: chat.id, date: "2026-03-10", messages: [], ledger: [], changedAt: clock },
+    ]);
   });
 
   it("deletes a channel message only in its own box", () => {
@@ -533,6 +589,6 @@ describe("TelegramArchive media lifecycle", () => {
     raw.close();
     archive = TelegramArchive.open(dir, null, { now: () => clock });
     expect(read(1)).toMatchObject({ mediaState: "pending", mediaNextAttempt: 0 });
-    expect(archive.getMeta("schema_version")).toBe("4");
+    expect(archive.getMeta("schema_version")).toBe("5");
   });
 });

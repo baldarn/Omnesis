@@ -194,6 +194,35 @@ describe("the bootstrap walk through a data export", () => {
     expect(r.provider.getArchive().messageCount()).toBe(250);
   });
 
+  it("continues the same export after the context is rebuilt or restarted", async () => {
+    const r = await takeoutRig({ walkLimits: { requestsPerPage: 3 } });
+    const first = await r.source.sync(null);
+    expect(methods(r, "initTakeout")).toHaveLength(1);
+    expect(r.provider.getArchive().takeoutState().state).toBe("active");
+    // A config change, an enable or a re-authentication opens a new context.
+    await r.restart({ takeout: true, walkLimits: { requestsPerPage: 3 } });
+    await syncAll(r.source, first.cursor);
+
+    expect(methods(r, "initTakeout")).toHaveLength(1);
+    expect(methods(r, "getHistory")).toEqual([]);
+    expect(methods(r, "finishTakeout")).toHaveLength(1);
+    expect(r.provider.getArchive().takeoutState().state).toBe("done");
+    expect(r.provider.getArchive().takeoutSession()).toBeUndefined();
+    expect(r.provider.getArchive().messageCount()).toBe(250);
+  });
+
+  it("reads the normal way when a resumed export is no longer honoured", async () => {
+    const r = await takeoutRig({ walkLimits: { requestsPerPage: 3 } });
+    const first = await r.source.sync(null);
+    r.sim.endTakeouts();
+    await r.restart({ takeout: true, walkLimits: { requestsPerPage: 3 } });
+    await syncAll(r.source, first.cursor);
+
+    expect(methods(r, "initTakeout")).toHaveLength(1);
+    expect(r.provider.getArchive().takeoutState().state).toBe("unavailable");
+    expect(r.provider.getArchive().messageCount()).toBe(250);
+  });
+
   it("walks the normal way when Telegram refuses an export outright", async () => {
     const r = await takeoutRig();
     r.sim.failNext("initTakeout", new TelegramError("unknown", "Telegram error 400 SOMETHING"));

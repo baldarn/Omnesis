@@ -8,6 +8,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SyncError } from "@omnesis/types";
 import {
   DAVID,
   JAMIE,
@@ -24,6 +25,7 @@ import {
 import { isChatIncluded } from "./history-walker.js";
 import { TelegramError } from "./client/types.js";
 import { HISTORY_MIN_INTERVAL_MS } from "./limits.js";
+import { REVOKED_REMEDIATION } from "./provider.js";
 import type { SyncResult } from "@omnesis/source-sdk";
 import type { TgChat, TgMessage } from "./client/types.js";
 import type { TelegramSyncCursor } from "./types.js";
@@ -221,6 +223,41 @@ describe("upstream failures", () => {
     const { pages } = await syncAll(rig.source, page.cursor);
     expect(pages.at(-1)!.progress).toMatchObject({ phase: "incremental", coverage: "complete" });
     expect(rig.provider.getArchive().messageCount()).toBe(3);
+  });
+
+  it("reports a session Telegram ends mid-walk as the auth failure with its remedy", async () => {
+    rig = await syncRig({
+      users: [JAMIE],
+      chats: [{ chat: JAMIE_CHAT, messages: messageRun(JAMIE_CHAT, JAMIE, 1, 3, T0) }],
+    });
+    rig.sim.failNext(
+      "getHistory",
+      new TelegramError("revoked", "SESSION_REVOKED", {
+        reason: "SESSION_REVOKED",
+        rpc: "SESSION_REVOKED",
+      }),
+    );
+    const failure = await rig.source.sync(null).catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(SyncError);
+    expect(failure).toMatchObject({ kind: "auth", remediation: REVOKED_REMEDIATION });
+  });
+
+  it("hands the sync's abort signal to every history request", async () => {
+    rig = await syncRig({
+      users: [JAMIE],
+      chats: [{ chat: JAMIE_CHAT, messages: messageRun(JAMIE_CHAT, JAMIE, 1, 3, T0) }],
+    });
+    const adapter = rig.provider.getAdapter();
+    const seen: Array<AbortSignal | undefined> = [];
+    const original = adapter.getHistory.bind(adapter);
+    adapter.getHistory = (chatId, opts) => {
+      seen.push(opts.signal);
+      return original(chatId, opts);
+    };
+    const controller = new AbortController();
+    await rig.source.sync(null, { signal: controller.signal });
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((signal) => signal === controller.signal)).toBe(true);
   });
 
   it("skips a chat Telegram refuses, walks the rest, and offers it again at the next full reconcile", async () => {
@@ -475,5 +512,74 @@ describe("gap recovery", () => {
       "Corrected: the review is on Friday",
     );
     expect(archive.walkSummary().reconcilePending).toBe(false);
+  });
+
+  describe("a presence check deletes only on a conclusive answer", () => {
+    async function gapped(): Promise<TelegramSyncCursor> {
+      const now = Math.floor(Date.now() / 1000);
+      const { cursor } = await walked([
+        { chat: JAMIE_CHAT, messages: messageRun(JAMIE_CHAT, JAMIE, 1, 4, now - 3600) },
+      ]);
+      rig!.sim.emitGap("account");
+      return cursor;
+    }
+
+    const surviving = (): number =>
+      [1, 2, 3, 4].filter((id) => rig!.provider.getArchive().hasMessage(JAMIE_CHAT.id, id)).length;
+
+    it("deletes nothing when the presence request fails", async () => {
+      const cursor = await gapped();
+      rig!.sim.failNext("getMessagesCommon", new TelegramError("network", "Connection reset"));
+      await syncAll(rig!.source, cursor);
+      expect(surviving()).toBe(4);
+    });
+
+    it("deletes nothing when the answer does not line up with the ids asked", async () => {
+      const cursor = await gapped();
+      const adapter = rig!.provider.getAdapter();
+      const original = adapter.getMessagesCommon.bind(adapter);
+      adapter.getMessagesCommon = async (ids, opts) => (await original(ids, opts)).slice(1);
+      await syncAll(rig!.source, cursor);
+      expect(surviving()).toBe(4);
+      expect(rig!.provider.getArchive().walkSummary().reconcilePending).toBe(false);
+    });
+
+    it("deletes nothing when a whole batch comes back empty and the chat no longer reads", async () => {
+      const cursor = await gapped();
+      const adapter = rig!.provider.getAdapter();
+      adapter.getMessagesCommon = (ids) => Promise.resolve(ids.map(() => null));
+      const history = adapter.getHistory.bind(adapter);
+      adapter.getHistory = (chatId, opts) =>
+        opts.offsetId === 0 && opts.limit === 1
+          ? Promise.resolve({ messages: [], users: [] })
+          : history(chatId, opts);
+      await syncAll(rig!.source, cursor);
+      expect(surviving()).toBe(4);
+    });
+
+    it("deletes a whole batch when the chat still reads past it", async () => {
+      const cursor = await gapped();
+      const older = messageIn(JAMIE_CHAT, 99, T0 - 86_400, "Older note", { senderId: JAMIE.id });
+      const adapter = rig!.provider.getAdapter();
+      adapter.getMessagesCommon = (ids) => Promise.resolve(ids.map(() => null));
+      adapter.getHistory = (_chatId, opts) =>
+        Promise.resolve({ messages: opts.limit === 1 ? [older] : [], users: [] });
+      await syncAll(rig!.source, cursor);
+      expect(surviving()).toBe(0);
+    });
+
+    it("hands the sync's abort signal to the presence request", async () => {
+      const cursor = await gapped();
+      const adapter = rig!.provider.getAdapter();
+      const seen: Array<AbortSignal | undefined> = [];
+      const original = adapter.getMessagesCommon.bind(adapter);
+      adapter.getMessagesCommon = (ids, opts) => {
+        seen.push(opts?.signal);
+        return original(ids, opts);
+      };
+      const controller = new AbortController();
+      await rig!.source.sync(cursor, { signal: controller.signal });
+      expect(seen).toEqual([controller.signal]);
+    });
   });
 });

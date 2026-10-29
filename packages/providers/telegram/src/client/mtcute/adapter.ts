@@ -23,7 +23,9 @@
 
 import {
   BaseTelegramClient,
+  Long,
   MemoryStorage,
+  TakeoutSession,
   TelegramClient,
   getMarkedPeerId,
   md,
@@ -239,7 +241,15 @@ class MtcuteTelegramAdapter implements TelegramAdapter {
     chatId: number,
     opts: { offsetId: number; limit: number; minId?: number; signal?: AbortSignal },
   ): Promise<{ messages: TgMessage[]; users: TgUser[] }> {
-    return this.historyPage((params) => this.client.getHistory(chatId, params), opts);
+    return this.historyPage(
+      (params) => this.withSignal(opts.signal).getHistory(chatId, params),
+      opts,
+    );
+  }
+
+  /** The client with every call it makes bound to `signal`. */
+  private withSignal(signal: AbortSignal | undefined): TelegramClient {
+    return signal ? this.client.withParams({ abortSignal: signal }) : this.client;
   }
 
   /** One history page through `read`, converted; shared by the plain and the takeout reads. */
@@ -265,28 +275,63 @@ class MtcuteTelegramAdapter implements TelegramAdapter {
    * `invokeWithTakeout`; the flood waiter middleware applies to it as to any
    * call, and its waits surface as the walk's own flood wait.
    */
-  async takeout(scope: TakeoutScope): Promise<TelegramTakeout> {
-    const session = await this.guard(() =>
-      this.client.initTakeoutSession({ ...scope, contacts: false, files: false }),
-    );
-    const proxy = session.createProxy();
+  async takeout(
+    scope: TakeoutScope,
+    opts?: { signal?: AbortSignal; resumeId?: string },
+  ): Promise<TelegramTakeout> {
+    const session = opts?.resumeId
+      ? new TakeoutSession(this.client, {
+          _: "account.takeout",
+          id: Long.fromString(opts.resumeId),
+        })
+      : await this.guard(() =>
+          this.withSignal(opts?.signal).initTakeoutSession({
+            ...scope,
+            contacts: false,
+            files: false,
+          }),
+        );
     return {
+      id: session.id.toString(),
       scope,
-      getHistory: (chatId, opts) =>
-        this.historyPage((params) => getHistoryThrough(proxy, chatId, params), opts),
-      finish: (success) => this.guard(() => session.finish(success)),
+      getHistory: (chatId, page) =>
+        this.historyPage(
+          (params) =>
+            getHistoryThrough(
+              session.createProxy(page.signal ? { abortSignal: page.signal } : undefined),
+              chatId,
+              params,
+            ),
+          page,
+        ),
+      finish: (success, finishOpts) =>
+        this.guard(async () => {
+          const done = await session.call(
+            { _: "account.finishTakeoutSession", success },
+            finishOpts?.signal ? { abortSignal: finishOpts.signal } : undefined,
+          );
+          if (!done) throw new TelegramError("unknown", "Telegram did not finish the data export");
+        }),
     };
   }
 
-  getMessages(chatId: number, ids: number[]): Promise<(TgMessage | null)[]> {
+  getMessages(
+    chatId: number,
+    ids: number[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<(TgMessage | null)[]> {
     return this.guard(async () =>
-      (await this.client.getMessages(chatId, ids)).map((m) => (m ? convertMessage(m) : null)),
+      (await this.withSignal(opts?.signal).getMessages(chatId, ids)).map((m) =>
+        m ? convertMessage(m) : null,
+      ),
     );
   }
 
-  getMessagesCommon(ids: number[]): Promise<(TgMessage | null)[]> {
+  getMessagesCommon(ids: number[], opts?: { signal?: AbortSignal }): Promise<(TgMessage | null)[]> {
     return this.guard(async () =>
-      (await this.client.getMessagesUnsafe(ids)).map((m) => (m ? convertMessage(m) : null)),
+      (await this.withSignal(opts?.signal).getMessagesUnsafe(ids)).map((m) =>
+        m ? convertMessage(m) : null,
+      ),
     );
   }
 
@@ -415,6 +460,18 @@ class MtcuteAuthAdapter implements TelegramAuthAdapter {
     }
   }
 
+  async logOutSession(session: string, opts: { signal: AbortSignal }): Promise<void> {
+    try {
+      await this.client.importSession(session, true);
+      opts.signal.throwIfAborted();
+      await this.client.withParams({ abortSignal: opts.signal }).logOut();
+    } catch (err) {
+      const mapped = toTelegramError(err);
+      // Already ended elsewhere: nothing is left to log out.
+      if (mapped.code !== "revoked") throw mapped;
+    }
+  }
+
   async close(): Promise<void> {
     await this.client.destroy();
   }
@@ -443,7 +500,8 @@ function toTgUser(u: User, selfId: number): TgUser {
     username: u.username ?? undefined,
     phone: u.phoneNumber ?? undefined,
     // TL flags are absent rather than false when unset.
-    isBot: u.isBot === true,
+    // Telegram's support accounts are not people either.
+    isBot: u.isBot === true || u.isSupport === true,
     isDeleted: u.isDeleted === true,
     isSelf: u.isSelf === true || u.id === selfId,
   };

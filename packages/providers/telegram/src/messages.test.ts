@@ -6,7 +6,7 @@
  * a page emits, what it tombstones, and that the page loop settles.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { expectUnchangedUpstreamIsNoOp } from "@omnesis/source-sdk/testing";
 import { SyncError } from "@omnesis/types";
 import { resolveAttachmentConfig } from "@omnesis/core";
@@ -205,6 +205,65 @@ describe("TelegramMessagesSource.sync", () => {
     // page's days come back.
     const page = await r.source.sync(foreign);
     expect(page.documents.length).toBeGreaterThan(0);
+  });
+
+  it("publishes the other days when one day cannot render, and keeps that day queued", async () => {
+    const r = await twoChatRig();
+    const archive = r.provider.getArchive();
+    const getUsers = archive.getUsers.bind(archive);
+    archive.getUsers = (ids) => {
+      if ([...ids].includes(JAMIE.id)) throw new Error("render exploded");
+      return getUsers(ids);
+    };
+    const boot = await syncAll(r.source, null);
+    const docs = latestDocs(boot.pages);
+    expect([...docs.keys()]).toEqual([`${DAVID.id}:2026-03-11`]);
+    expect(boot.pages.at(-1)!.issues).toEqual([
+      expect.objectContaining({ scope: "item", count: 1, severity: "warning" }),
+    ]);
+    // Acknowledged pages never clear it.
+    const again = await r.source.sync(boot.cursor);
+    expect(archive.quarantinedDayCount()).toBe(1);
+    expect(archive.dirtyDayCount()).toBeGreaterThanOrEqual(1);
+
+    archive.getUsers = getUsers;
+    const now = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now: now + 120_000 });
+    try {
+      const healed = await r.source.sync(again.cursor);
+      expect(healed.documents.map((d) => d.externalId)).toEqual([JAMIE_DAY]);
+      expect(healed.issues).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("tombstones a published day the data cutoff later moved past", async () => {
+    const r = await twoChatRig();
+    const boot = await syncAll(r.source, null);
+    r.provider
+      .getArchive()
+      .settleAttachments(JAMIE_CHAT.id, "2026-03-10", [`${JAMIE_DAY}/att/abc`], 1);
+    r.remake({ dataCutoff: new Date((T0 + 86_400) * 1000).toISOString() });
+    r.source.onResync();
+    const { pages } = await syncAll(r.source, boot.cursor);
+    const removed = pages.flatMap((p) => p.deletedExternalIds);
+    expect(removed).toEqual(expect.arrayContaining([JAMIE_DAY, `${JAMIE_DAY}/att/abc`]));
+    expect([...latestDocs(pages).keys()]).toEqual([`${DAVID.id}:2026-03-11`]);
+  });
+
+  it("moves sourceUpdatedAt forward when the day's latest message is deleted", async () => {
+    const r = await twoChatRig();
+    const boot = await syncAll(r.source, null);
+    const before = latestDocs(boot.pages).get(JAMIE_DAY)!.sourceUpdatedAt!;
+    r.sim.pushDelete(JAMIE_CHAT.id, [3]);
+    const page = await r.source.sync(boot.cursor);
+    const after = page.documents.find((d) => d.externalId === JAMIE_DAY)!.sourceUpdatedAt!;
+    expect(Date.parse(after)).toBeGreaterThan(Date.parse(before));
+    r.sim.pushNew(JAMIE_CHAT.id, { text: "Studio Northstar booked", date: T0 + 30 });
+    const next = await r.source.sync(page.cursor);
+    const latest = next.documents.find((d) => d.externalId === JAMIE_DAY)!.sourceUpdatedAt!;
+    expect(Date.parse(latest)).toBeGreaterThanOrEqual(Date.parse(after));
   });
 
   it("re-emits everything on a resync", async () => {

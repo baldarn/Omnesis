@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SyncError } from "@omnesis/types";
 import { REVOKED_REMEDIATION, TelegramProvider } from "./provider.js";
 import { readSessionRecord, writeSessionRecord } from "./session-store.js";
-import { REVOCATION_REASONS, TelegramError } from "./client/types.js";
+import { REVOCATION_REASONS, TelegramError, type TelegramAdapter } from "./client/types.js";
 import { SimulatedTelegram } from "./testing/simulated-telegram.js";
 import { OTHER_ACCOUNT, SELF, tempConfigDir, writeAppCredentials } from "./testing/fixtures.js";
 
@@ -80,6 +80,13 @@ describe("TelegramProvider", () => {
       configDir,
     );
     await expect(openProvider()).rejects.toThrow(/re-authenticate/u);
+  });
+
+  it("refuses those as auth failures carrying the re-authentication remedy", async () => {
+    rmSync(join(configDir, "telegram"), { recursive: true, force: true });
+    const failure = await openProvider().catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(SyncError);
+    expect(failure).toMatchObject({ kind: "auth", remediation: REVOKED_REMEDIATION });
   });
 
   it.each(REVOCATION_REASONS)(
@@ -178,6 +185,85 @@ describe("TelegramProvider", () => {
     await expect(provider.ensureUsable()).resolves.toBeUndefined();
   });
 
+  it("connects a rebuilt context only once the previous one on the directory has closed", async () => {
+    const first = await openProvider();
+    const connects = () => sim.calls.filter((c) => c.method === "connect").length;
+    // The host opens the new context before its disposal of the old one has finished.
+    const second = await TelegramProvider.open({
+      accountId: ACCOUNT,
+      configDir,
+      stateDir,
+      factory: sim.factory,
+    });
+    open.push(second);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(connects()).toBe(1);
+    expect(sim.activeConnections).toBe(1);
+
+    await first.dispose();
+    await second.ready();
+    const order = sim.calls.map((c) => c.method).filter((m) => m === "connect" || m === "close");
+    expect(order).toEqual(["connect", "close", "connect"]);
+    expect(sim.activeConnections).toBe(1);
+    await expect(second.ensureUsable()).resolves.toBeUndefined();
+    await expect(readSessionRecord(ACCOUNT, configDir)).resolves.toMatchObject({
+      session: expect.stringMatching(/^sim-session:/u),
+    });
+  });
+
+  it("never makes one account wait for another", async () => {
+    const first = await openProvider();
+    await writeSessionRecord(
+      {
+        session: sim.issueSession(OTHER_ACCOUNT.id),
+        userId: String(OTHER_ACCOUNT.id),
+        apiId: "1234567",
+        connectedAt: "2026-03-10T09:00:00.000Z",
+      },
+      configDir,
+    );
+    const other = await TelegramProvider.open({
+      accountId: String(OTHER_ACCOUNT.id),
+      configDir,
+      stateDir: join(configDir, "telegram", String(OTHER_ACCOUNT.id)),
+      factory: sim.factory,
+    });
+    open.push(other);
+    await other.ready();
+    expect(sim.activeConnections).toBe(2);
+    await expect(first.ensureUsable()).resolves.toBeUndefined();
+    await expect(other.ensureUsable()).resolves.toBeUndefined();
+  });
+
+  it("closes once the last source built on it is released, and not before", async () => {
+    const provider = await openProvider();
+    const a = provider.attach();
+    const b = provider.attach();
+    await a();
+    await a();
+    expect(sim.activeConnections).toBe(1);
+    await b();
+    expect(sim.activeConnections).toBe(0);
+    await provider.whenClosed;
+  });
+
+  it("gives up waiting for the connection when the sync is cancelled", async () => {
+    const provider = await openProvider();
+    await provider.suspend();
+    await provider.dispose();
+    const blocked = await TelegramProvider.open({
+      accountId: ACCOUNT,
+      configDir,
+      stateDir,
+      factory: { ...sim.factory, live: (...args) => hangingConnect(sim.factory.live(...args)) },
+    });
+    open.push(blocked);
+    const controller = new AbortController();
+    const pending = blocked.ensureUsable(controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ kind: "network" });
+  });
+
   it("dispose is idempotent and closes the client", async () => {
     const provider = await openProvider();
     await provider.dispose();
@@ -186,3 +272,10 @@ describe("TelegramProvider", () => {
     expect(sim.calls.filter((c) => c.method === "close")).toHaveLength(1);
   });
 });
+
+/** An adapter whose connect never settles until it is closed. */
+function hangingConnect(adapter: TelegramAdapter): TelegramAdapter {
+  return Object.assign(Object.create(adapter) as TelegramAdapter, {
+    connect: () => new Promise<never>(() => undefined),
+  });
+}

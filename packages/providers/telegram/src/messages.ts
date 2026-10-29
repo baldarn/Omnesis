@@ -25,6 +25,7 @@
 import {
   createLogger,
   resolveAttachmentConfig,
+  toErrorMessage,
   transcriptionSyncIssues,
   type AttachmentExtractFn,
   type AttachmentExtractionConfig,
@@ -43,14 +44,14 @@ import {
   MEDIA_ATTEMPTS_PER_PAGE,
   MEDIA_CONTINUATION_MARGIN_MS,
 } from "./limits.js";
-import { MediaPass, mediaScopeOf, newMediaBudget } from "./media.js";
+import { MediaPass, mediaScopeOf, newMediaBudget, type MediaBudget } from "./media.js";
 import { dayExternalId, normalizeDayChat } from "./normalizer.js";
 import { telegramStateSpec } from "./state.js";
-import type { MediaScope } from "./message-store.js";
+import type { DrainedDay, MediaScope, TelegramArchive } from "./message-store.js";
 import type { HistoryCoverage, SyncOptions, SyncResult, Unsubscribe } from "@omnesis/source-sdk";
 import type { DocumentInput, ProviderId, SourceId, SyncIssue } from "@omnesis/types";
 import type { TelegramProvider } from "./provider.js";
-import type { TelegramSyncCursor } from "./types.js";
+import type { StoredMessage, TelegramSyncCursor } from "./types.js";
 
 const log = createLogger("source:telegram-messages");
 
@@ -203,6 +204,56 @@ export class TelegramMessagesSource {
     this.mediaWake.unref?.();
   }
 
+  /** One day's document and its attachments; the ids its attachment ledger retired. */
+  private async renderDay(
+    chat: NonNullable<ReturnType<TelegramArchive["getChat"]>>,
+    day: DrainedDay,
+    messages: StoredMessage[],
+    budget: MediaBudget,
+    emitSeq: number,
+    signal: AbortSignal | undefined,
+  ): Promise<{ documents: DocumentInput[]; retired: string[] }> {
+    const archive = this.provider.getArchive();
+    const self = this.provider.selfUser();
+    const userIds = messages.flatMap((m) => (m.senderId !== undefined ? [m.senderId] : []));
+    if (chat.kind === "private") userIds.push(chat.chatId);
+    const users = archive.getUsers(userIds);
+    const inDay = new Map(messages.map((m) => [m.msgId, m]));
+    const replyIds = messages.flatMap((m) =>
+      m.replyToId !== undefined && !inDay.has(m.replyToId) ? [m.replyToId] : [],
+    );
+    const replies = new Map([...inDay, ...archive.getMessages(day.chatId, replyIds)]);
+    const topics = chat.isForum ? archive.getTopics(day.chatId) : undefined;
+    const context = { chat, messages, users, budget, ...(signal ? { signal } : {}) };
+    await this.media.transcribeVoiceNotes(context);
+    const doc = normalizeDayChat({
+      chat,
+      date: day.date,
+      messages,
+      users,
+      replies,
+      ...(topics ? { topics } : {}),
+      self: {
+        id: this.provider.selfId,
+        ...(self?.phoneE164 ? { phoneE164: self.phoneE164 } : {}),
+      },
+      providerId: this.options.providerId,
+      sourceId: this.options.sourceId,
+      ...(this.options.phoneRegion ? { phoneRegion: this.options.phoneRegion } : {}),
+      ...(day.changedAt !== undefined ? { changedAt: day.changedAt } : {}),
+    });
+    const attachments = await this.media.extractAttachments(doc, context);
+    // Every attachment the day still holds is in this render; the ledger
+    // retires the rest (a deleted message's file) for tombstoning.
+    const retired = archive.settleAttachments(
+      day.chatId,
+      day.date,
+      attachments.map((a) => a.externalId),
+      emitSeq,
+    );
+    return { documents: [doc, ...attachments], retired };
+  }
+
   async sync(
     cursor: TelegramSyncCursor | null,
     opts?: SyncOptions,
@@ -219,10 +270,17 @@ export class TelegramMessagesSource {
       log.info(`Telegram chat exclusions changed: ${purged} purged, ${restored} restored`);
     }
 
-    const walk = await this.walker.run({
-      ...(opts?.run?.deadline !== undefined ? { deadline: opts.run.deadline } : {}),
-      ...(opts?.signal ? { signal: opts.signal } : {}),
-    });
+    let walk: Awaited<ReturnType<HistoryWalker["run"]>>;
+    try {
+      walk = await this.walker.run({
+        ...(opts?.run?.deadline !== undefined ? { deadline: opts.run.deadline } : {}),
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+      });
+    } catch (err) {
+      // Only a revoked session escapes the walk: reported as the auth
+      // failure, with its remedy, every other request path reports.
+      throw this.provider.syncErrorFrom(err);
+    }
 
     // The retry sweep: re-arm the days of media whose backoff ended, only as
     // many as this page can attempt.
@@ -232,7 +290,6 @@ export class TelegramMessagesSource {
       committedSeq,
       limit: this.drainLimit,
     });
-    const self = this.provider.selfUser();
     const documents: DocumentInput[] = [];
     const deletedExternalIds: string[] = [];
     const budget = newMediaBudget(this.mediaAttempts);
@@ -240,64 +297,36 @@ export class TelegramMessagesSource {
     for (const day of days) {
       const id = dayExternalId(day.chatId, day.date);
       const chat = archive.getChat(day.chatId);
-      if (!chat || day.messages.length === 0) {
+      const messages =
+        this.cutoffTs === undefined
+          ? day.messages
+          : day.messages.filter((m) => m.ts >= this.cutoffTs!);
+      // Nothing left to show: no chat, every message deleted, or (after the
+      // cutoff moved later) only messages before it. Tombstoned in each case,
+      // which is a no-op for a day never published.
+      if (!chat || messages.length === 0) {
         deletedExternalIds.push(
           id,
           ...archive.settleAttachments(day.chatId, day.date, [], emitSeq),
         );
         continue;
       }
-      const messages =
-        this.cutoffTs === undefined
-          ? day.messages
-          : day.messages.filter((m) => m.ts >= this.cutoffTs!);
-      // Older than the cutoff: never published, so nothing to remove either.
-      if (messages.length === 0) continue;
-      const userIds = messages.flatMap((m) => (m.senderId !== undefined ? [m.senderId] : []));
-      if (chat.kind === "private") userIds.push(chat.chatId);
-      const users = archive.getUsers(userIds);
-      const inDay = new Map(messages.map((m) => [m.msgId, m]));
-      const replyIds = messages.flatMap((m) =>
-        m.replyToId !== undefined && !inDay.has(m.replyToId) ? [m.replyToId] : [],
-      );
-      const replies = new Map([...inDay, ...archive.getMessages(day.chatId, replyIds)]);
-      const topics = chat.isForum ? archive.getTopics(day.chatId) : undefined;
-      const context = {
-        chat,
-        messages,
-        users,
-        budget,
-        ...(opts?.signal ? { signal: opts.signal } : {}),
-      };
-      await this.media.transcribeVoiceNotes(context);
-      const doc = normalizeDayChat({
-        chat,
-        date: day.date,
-        messages,
-        users,
-        replies,
-        ...(topics ? { topics } : {}),
-        self: {
-          id: this.provider.selfId,
-          ...(self?.phoneE164 ? { phoneE164: self.phoneE164 } : {}),
-        },
-        providerId: this.options.providerId,
-        sourceId: this.options.sourceId,
-        ...(this.options.phoneRegion ? { phoneRegion: this.options.phoneRegion } : {}),
-      });
-      const attachments = await this.media.extractAttachments(doc, context);
-      documents.push(doc, ...attachments);
-      // Every attachment the day still holds is in this render; the ledger
-      // retires the rest (a deleted message's file) for tombstoning.
-      deletedExternalIds.push(
-        ...archive.settleAttachments(
-          day.chatId,
-          day.date,
-          attachments.map((a) => a.externalId),
-          emitSeq,
-        ),
-      );
-      processed += messages.length;
+      // One day that cannot render must not hold back the rest of the page.
+      try {
+        const rendered = await this.renderDay(chat, day, messages, budget, emitSeq, opts?.signal);
+        documents.push(...rendered.documents);
+        deletedExternalIds.push(...rendered.retired);
+        processed += messages.length;
+      } catch (err) {
+        const failures = archive.quarantineDay(day.chatId, day.date);
+        if (failures === 1) {
+          log.warn(
+            `Telegram day ${id} failed to render; retrying it on a backoff: ${toErrorMessage(err)}`,
+          );
+        } else {
+          log.debug(`Telegram day ${id} failed to render again (${failures} times)`);
+        }
+      }
     }
 
     const summary = archive.walkSummary();
@@ -337,6 +366,17 @@ export class TelegramMessagesSource {
     const takeout = archive.takeoutState();
     if (this.options.takeout && takeout.state === "delayed" && unwalked > 0) {
       issues.push(takeoutApprovalIssue(unwalked, takeout.retryAt));
+    }
+    // Days that failed to render stay queued; say so rather than drop them.
+    const quarantined = archive.quarantinedDayCount();
+    if (quarantined > 0) {
+      issues.push({
+        scope: "item",
+        kind: "unknown",
+        severity: "warning",
+        count: quarantined,
+        message: `${quarantined} Telegram chat ${quarantined === 1 ? "day" : "days"} could not be rendered; Omnesis keeps retrying.`,
+      });
     }
     // The media backlog, stated once, on the page that ends the run (the host
     // sums issues across a run's pages).

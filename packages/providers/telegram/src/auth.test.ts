@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MissingCredentialsError, listProviderAccountIds } from "@omnesis/core";
 import { AuthFailure } from "@omnesis/source-sdk";
-import { loginFlow } from "./auth.js";
+import { loginFlow, removeConnectedAccount } from "./auth.js";
+import { mapRpcError } from "./client/errors.js";
 import { readSessionRecord, writeSessionRecord } from "./session-store.js";
 import { SimulatedTelegram } from "./testing/simulated-telegram.js";
 import {
@@ -207,6 +208,27 @@ describe("Telegram sign-in", () => {
     expectNothingPersisted();
   });
 
+  it.each([
+    [403, "USER_DEACTIVATED", "denied"],
+    [401, "USER_DEACTIVATED_BAN", "denied"],
+    [400, "PHONE_NUMBER_BANNED", "denied"],
+    [400, "PHONE_NUMBER_INVALID", "credential-rejected"],
+    [400, "AUTH_TOKEN_INVALID", "credential-rejected"],
+    [401, "AUTH_KEY_UNREGISTERED", "credential-rejected"],
+    [400, "AUTH_TOKEN_EXPIRED", "challenge-expired"],
+    [420, "PHONE_NUMBER_FLOOD", "unavailable"],
+    [400, "SOMETHING_ELSE_ENTIRELY", "unknown"],
+  ])("maps a %s %s refusal to %s and stores nothing", async (code, text, expected) => {
+    sim.failNext("signInQr", mapRpcError({ code, text }));
+    const { session } = scriptedSession(configDir);
+    const failure = (await loginFlow(session, { factory: sim.factory }).catch(
+      (e: unknown) => e,
+    )) as AuthFailure;
+    expect(failure).toBeInstanceOf(AuthFailure);
+    expect(failure.code).toBe(expected);
+    expectNothingPersisted();
+  });
+
   it("times out when nobody scans, and stores nothing", async () => {
     const { session } = scriptedSession(configDir);
     const failure = (await loginFlow(session, { factory: sim.factory, timeoutMs: 30 }).catch(
@@ -214,5 +236,58 @@ describe("Telegram sign-in", () => {
     )) as AuthFailure;
     expect(failure.code).toBe("timeout");
     expectNothingPersisted();
+  });
+
+  it("removes an account whose logout hangs once the wait runs out", async () => {
+    await writeSessionRecord(
+      {
+        session: sim.issueSession(SELF.id),
+        userId: String(SELF.id),
+        apiId: "1234567",
+        connectedAt: "2026-03-10T09:00:00.000Z",
+      },
+      configDir,
+    );
+    const hanging = {
+      ...sim.factory,
+      auth: (...args: Parameters<typeof sim.factory.auth>) => {
+        const real = sim.factory.auth(...args);
+        return {
+          ...real,
+          close: () => real.close(),
+          logOutSession: (_session: string, opts: { signal: AbortSignal }) =>
+            new Promise<void>((_resolve, reject) =>
+              opts.signal.addEventListener("abort", () => reject(new Error("aborted"))),
+            ),
+        };
+      },
+    };
+    const stateDir = join(configDir, "telegram", String(SELF.id));
+    await expect(
+      removeConnectedAccount(String(SELF.id), configDir, {
+        factory: hanging,
+        stateDir,
+        timeoutMs: 30,
+      }),
+    ).rejects.toThrow(/timed out/u);
+    expect(existsSync(stateDir)).toBe(false);
+  });
+
+  it("removes an account whose session already ended without asking Telegram", async () => {
+    await writeSessionRecord(
+      {
+        session: "",
+        userId: String(SELF.id),
+        apiId: "1234567",
+        connectedAt: "2026-03-10T09:00:00.000Z",
+        revokedAt: "2026-03-11T08:00:00.000Z",
+        revokedReason: "SESSION_REVOKED",
+      },
+      configDir,
+    );
+    const stateDir = join(configDir, "telegram", String(SELF.id));
+    await removeConnectedAccount(String(SELF.id), configDir, { factory: sim.factory, stateDir });
+    expect(existsSync(stateDir)).toBe(false);
+    expect(sim.calls).toEqual([]);
   });
 });

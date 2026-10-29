@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { Dialog, Message, PeersIndex, tl } from "@mtcute/node";
+import { Dialog, Long, Message, PeersIndex, tl } from "@mtcute/node";
 import {
   chatKind,
   convertMessage,
@@ -503,16 +503,33 @@ describe("MtcuteTelegramAdapter.takeout", () => {
   }
 
   it("asks for an export of messages only, never files or contacts, and finishes it", async () => {
-    const finish = vi.fn(() => Promise.resolve());
+    const call = vi.fn((_req: unknown, _opts?: unknown) => Promise.resolve(true));
     const { adapter, init, dispose } = adapterWith(() =>
-      Promise.resolve({ createProxy: () => ({}), finish }),
+      Promise.resolve({ id: Long.fromInt(77), createProxy: () => ({}), call }),
     );
     try {
       const takeout = await adapter.takeout(SCOPE);
       expect(init).toHaveBeenCalledWith({ ...SCOPE, contacts: false, files: false });
       expect(takeout.scope).toEqual(SCOPE);
-      await takeout.finish(true);
-      expect(finish).toHaveBeenCalledWith(true);
+      expect(takeout.id).toBe("77");
+      const controller = new AbortController();
+      await takeout.finish(true, { signal: controller.signal });
+      expect(call).toHaveBeenCalledWith(
+        { _: "account.finishTakeoutSession", success: true },
+        { abortSignal: controller.signal },
+      );
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("resumes a kept export session by its id without asking Telegram for a new one", async () => {
+    const { adapter, init, dispose } = adapterWith(() => Promise.reject(new Error("unused")));
+    try {
+      const takeout = await adapter.takeout(SCOPE, { resumeId: "9007199254740993" });
+      expect(init).not.toHaveBeenCalled();
+      expect(takeout.id).toBe("9007199254740993");
+      expect(takeout.scope).toEqual(SCOPE);
     } finally {
       await dispose();
     }

@@ -19,6 +19,9 @@ export const MAX_PASSWORD_ATTEMPTS = 3;
  */
 export const LOGIN_TIMEOUT_MS = 13 * 60 * 1000;
 
+/** How long removing an account waits to end its Telegram session before removing it anyway. */
+export const LOGOUT_TIMEOUT_MS = 20 * 1000;
+
 /** How long a sync waits for the live connection before reporting a network failure. */
 export const CONNECT_TIMEOUT_MS = 60 * 1000;
 

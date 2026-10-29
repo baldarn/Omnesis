@@ -218,9 +218,13 @@ export interface TelegramAdapter {
     opts: { offsetId: number; limit: number; minId?: number; signal?: AbortSignal },
   ): Promise<{ messages: TgMessage[]; users: TgUser[] }>;
   /** Messages by id in one chat; `null` for an id that no longer exists. */
-  getMessages(chatId: number, ids: number[]): Promise<(TgMessage | null)[]>;
+  getMessages(
+    chatId: number,
+    ids: number[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<(TgMessage | null)[]>;
   /** Messages by id in the common box, which needs no peer. */
-  getMessagesCommon(ids: number[]): Promise<(TgMessage | null)[]>;
+  getMessagesCommon(ids: number[], opts?: { signal?: AbortSignal }): Promise<(TgMessage | null)[]>;
   /**
    * Download one message's media, at most `maxBytes` (a larger file fails as
    * `forbidden`). A stale file reference is refreshed by fetching the message
@@ -241,8 +245,16 @@ export interface TelegramAdapter {
    * against Telegram's export limits instead of the interactive ones. Fails
    * with a `takeout` error carrying `seconds` while Telegram waits for the
    * owner to approve the export on another device.
+   *
+   * With `resumeId`, no request is made: the session of that id, opened
+   * earlier on this authorization, is used again (a rebuilt context or a
+   * restart continues the same export). One Telegram no longer honours fails
+   * its first read with a `takeout` error.
    */
-  takeout(scope: TakeoutScope): Promise<TelegramTakeout>;
+  takeout(
+    scope: TakeoutScope,
+    opts?: { signal?: AbortSignal; resumeId?: string },
+  ): Promise<TelegramTakeout>;
 }
 
 /** Which kinds of chat a takeout session may export. Files are never exported through it. */
@@ -255,6 +267,8 @@ export interface TakeoutScope {
 
 /** An open takeout session: only what the backward history walk needs. */
 export interface TelegramTakeout {
+  /** Telegram's id for the session, kept so a later client can resume it. */
+  readonly id: string;
   readonly scope: TakeoutScope;
   /** As {@link TelegramAdapter.getHistory}, through the export session. */
   getHistory(
@@ -262,7 +276,7 @@ export interface TelegramTakeout {
     opts: { offsetId: number; limit: number; signal?: AbortSignal },
   ): Promise<{ messages: TgMessage[]; users: TgUser[] }>;
   /** End the session; `success` says the export finished. */
-  finish(success: boolean): Promise<void>;
+  finish(success: boolean, opts?: { signal?: AbortSignal }): Promise<void>;
 }
 
 /** A client used only to sign in. It keeps nothing on disk. */
@@ -279,6 +293,11 @@ export interface TelegramAuthAdapter {
   }): Promise<{ self: TgUser; session: string }>;
   /** End the authorization this client just created. */
   logOut(): Promise<void>;
+  /**
+   * End a stored authorization: import `session` into this client's memory
+   * and log it out. A session Telegram already ended counts as ended.
+   */
+  logOutSession(session: string, opts: { signal: AbortSignal }): Promise<void>;
   close(): Promise<void>;
 }
 

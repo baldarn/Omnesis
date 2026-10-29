@@ -1,17 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Adrien Conrath
 
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderId, SourceId, SyncError } from "@omnesis/types";
 import { fakeProviderHost, fakeSourceHost } from "@omnesis/source-sdk/testing";
+import {
+  OMNESIS_INSTALL_ROOT_KEY,
+  clearSecretFileKeyCacheForTests,
+  createSecretStore,
+  ensureInstallRootKey,
+  providerAccountCredentialsPath,
+} from "@omnesis/core";
 import { telegramCredentialsSpec } from "./credentials-spec.js";
-import { writeSessionRecord } from "./session-store.js";
+import { readSessionRecord, writeSessionRecord } from "./session-store.js";
+import { TelegramError } from "./client/types.js";
 import { SimulatedTelegram } from "./testing/simulated-telegram.js";
 import {
+  DAVID,
+  JAMIE,
   OTHER_ACCOUNT,
   SELF,
+  T0,
+  messageRun,
+  privateChatWith,
   scriptedSession,
   tempConfigDir,
   until,
@@ -207,5 +220,120 @@ describe("the Telegram provider lifecycle", () => {
     await expect(definition.discover!({ configDir })).resolves.toEqual([
       expect.objectContaining({ id: String(OTHER_ACCOUNT.id) }),
     ]);
+  });
+
+  /** Both accounts with chats of their own, connected, each with its source. */
+  async function twoAccounts(): Promise<{
+    a: { ctx: TelegramProvider; source: SourceInstance; dir: string };
+    b: { ctx: TelegramProvider; source: SourceInstance; dir: string };
+  }> {
+    const mayaChat = privateChatWith(JAMIE);
+    const jamieChat = privateChatWith(DAVID);
+    sim = new SimulatedTelegram({
+      self: SELF,
+      users: [JAMIE],
+      chats: [{ chat: mayaChat, messages: messageRun(mayaChat, JAMIE, 1, 3, T0) }],
+    });
+    sim.addAccount({
+      self: OTHER_ACCOUNT,
+      users: [DAVID],
+      chats: [{ chat: jamieChat, messages: messageRun(jamieChat, DAVID, 1, 2, T0 + 86_400) }],
+    });
+    await seed(SELF);
+    await seed(OTHER_ACCOUNT);
+    const open = async (user: typeof SELF) => {
+      const id = String(user.id);
+      const ctx = await context(id);
+      return { ctx, source: await instance(id, ctx), dir: join(configDir, "telegram", id) };
+    };
+    return { a: await open(SELF), b: await open(OTHER_ACCOUNT) };
+  }
+
+  async function drain(source: SourceInstance): Promise<string[]> {
+    const ids: string[] = [];
+    let cursor: unknown = null;
+    for (let i = 0; i < 20; i++) {
+      const page = await source.sync(cursor as never);
+      ids.push(...page.documents.map((d) => d.externalId));
+      cursor = page.cursor;
+      if (!page.hasMore) return ids;
+    }
+    throw new Error("did not settle");
+  }
+
+  it("syncs two accounts at once into disjoint documents", async () => {
+    const { a, b } = await twoAccounts();
+    const [aDocs, bDocs] = await Promise.all([drain(a.source), drain(b.source)]);
+    expect(aDocs).toEqual([`${JAMIE.id}:2026-03-10`]);
+    expect(bDocs).toEqual([`${DAVID.id}:2026-03-11`]);
+    expect(a.ctx.storeId).not.toBe(b.ctx.storeId);
+  });
+
+  it("keeps one account syncing while the other is suspended", async () => {
+    const { a, b } = await twoAccounts();
+    await a.source.suspend!();
+    await expect(a.source.sync(null)).rejects.toMatchObject({ kind: "network" });
+    await expect(drain(b.source)).resolves.toEqual([`${DAVID.id}:2026-03-11`]);
+  });
+
+  it("ends a removed account's Telegram session and leaves the other account whole", async () => {
+    const { a, b } = await twoAccounts();
+    await drain(b.source);
+    // What a real client keeps beside the archive, for the survivor's check below.
+    writeFileSync(join(b.dir, "mtcute.db"), "");
+    const session = (await readSessionRecord(String(SELF.id), configDir))!.session;
+    // The host unregisters the source first, then removes the credentials.
+    await a.source.dispose!();
+    await definition.cleanupCredentials!(String(SELF.id), { configDir });
+
+    expect(sim.calls.filter((c) => c.method === "logOutSession")).toEqual([
+      expect.objectContaining({ args: { session } }),
+    ]);
+    expect(sim.sessionIsActive(session)).toBe(false);
+    expect(existsSync(a.dir)).toBe(false);
+    expect(existsSync(join(b.dir, "archive.db"))).toBe(true);
+    expect(existsSync(join(b.dir, "mtcute.db"))).toBe(true);
+    sim.pushNew(
+      DAVID.id,
+      { text: "Rehearsal moved to Friday", date: T0 + 90_000 },
+      OTHER_ACCOUNT.id,
+    );
+    await expect(drain(b.source)).resolves.toContain(`${DAVID.id}:2026-03-11`);
+  });
+
+  it("still removes an account whose session could not be ended, and says how to end it", async () => {
+    await seed(SELF);
+    sim.failNext("logOutSession", new TelegramError("network", "Connection reset"));
+    await expect(definition.cleanupCredentials!(String(SELF.id), { configDir })).rejects.toThrow(
+      /Settings → Devices/u,
+    );
+    expect(existsSync(join(configDir, "telegram", String(SELF.id)))).toBe(false);
+  });
+
+  it("leaves an account whose record cannot be read in place, so its session can still be ended", async () => {
+    vi.stubEnv("OMNESIS_SECRET_STORE", "file");
+    try {
+      await ensureInstallRootKey({ configDir, backend: "file" });
+      await seed(SELF);
+      // The keyring is locked: the sealed record exists and cannot be opened.
+      clearSecretFileKeyCacheForTests();
+      await createSecretStore({ configDir, backend: "file" }).delete(OMNESIS_INSTALL_ROOT_KEY);
+      const path = providerAccountCredentialsPath("telegram", String(SELF.id), configDir);
+      await expect(
+        definition.cleanupCredentials!(String(SELF.id), { configDir }),
+      ).rejects.toThrow();
+      expect(existsSync(path)).toBe(true);
+      expect(sim.calls.some((c) => c.method === "logOutSession")).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      clearSecretFileKeyCacheForTests();
+    }
+  });
+
+  it("refuses lifecycle calls that name no config directory", async () => {
+    await expect(definition.cleanupCredentials!(String(SELF.id))).rejects.toThrow(
+      /config directory/u,
+    );
+    await expect(definition.discover!()).rejects.toThrow(/config directory/u);
   });
 });

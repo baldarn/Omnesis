@@ -49,6 +49,24 @@ import type { ConnectionState } from "@omnesis/source-sdk";
 
 const log = createLogger("provider:telegram");
 
+/**
+ * Each account directory's newest provider's teardown, until it has run.
+ *
+ * The host rebuilds a context on every config change, enable and
+ * re-authentication, and opens the new one before the old one's disposal
+ * (which it does not await) has finished. Two clients on one auth key trip
+ * `AUTH_KEY_DUPLICATED`, which Telegram and this provider both treat as the
+ * end of the session. So a provider connects only once the previous provider
+ * of the same directory has closed. Keyed by directory, so one account never
+ * waits on another.
+ */
+const teardowns = new Map<string, Promise<void>>();
+
+/** Resolves once every provider opened on `stateDir` so far has closed. */
+export function accountClosed(stateDir: string): Promise<void> {
+  return teardowns.get(stateDir) ?? Promise.resolve();
+}
+
 export const REVOKED_REMEDIATION: SyncRemediation = {
   summary: "Telegram ended this connection",
   steps: ["Re-authenticate the Telegram source from Sources and scan the new code."],
@@ -71,8 +89,9 @@ type ConnectOutcome = { ok: true; self: TgUser } | { ok: false; error: unknown }
 export class TelegramProvider {
   readonly accountId: string;
   /**
-   * The bootstrap's data export session, once open. Kept here rather than on
-   * the source so a config change, which rebuilds the source, reuses it.
+   * The bootstrap's data export session, once open. A rebuilt context starts
+   * without one and resumes the export by the id the archive keeps
+   * (`HistoryWalker`), so a rebuild never asks Telegram for another.
    */
   readonly takeout: TakeoutHolder = { takeout: undefined };
   private readonly configDir: string;
@@ -83,6 +102,12 @@ export class TelegramProvider {
   private revocationWrite: Promise<void> = Promise.resolve();
   private disposed = false;
   private suspended = false;
+  /** Sources built on this context and not disposed yet. */
+  private attached = 0;
+  private readonly predecessor: Promise<void>;
+  private closed!: () => void;
+  /** Resolves once {@link dispose} has closed the client and the archive. */
+  readonly whenClosed: Promise<void>;
   private readonly errorHandlers = new Set<(error: string) => void>();
   private readonly changeHandlers = new Set<() => void>();
   private readonly unsubscribeUpdates: () => void;
@@ -102,25 +127,43 @@ export class TelegramProvider {
     this.configDir = options.configDir;
     this.now = options.now ?? (() => new Date());
     this.unsubscribeUpdates = adapter.onUpdate((u) => this.onUpdate(u));
+    const stateDir = options.stateDir;
+    this.predecessor = accountClosed(stateDir);
+    this.whenClosed = new Promise<void>((resolve) => (this.closed = resolve));
+    // Chained, not replaced: a third provider waits for the second, which
+    // already waits for the first.
+    const all = Promise.all([this.predecessor, this.whenClosed]).then(() => undefined);
+    teardowns.set(stateDir, all);
+    void all.then(() => {
+      if (teardowns.get(stateDir) === all) teardowns.delete(stateDir);
+    });
   }
 
   /**
    * Build the account's context and start connecting from its session.
    *
-   * Refuses an account with no stored session or a revoked one: there is
-   * nothing to connect with, and the remedy is to sign in again. The archive
-   * and the cache open under the `telegram-store` key, fail-closed.
+   * Refuses an account with no stored session or a revoked one, as an auth
+   * failure carrying the re-authentication remedy: there is nothing to
+   * connect with. The archive and the cache open under the `telegram-store`
+   * key, fail-closed. The connection itself starts once any earlier provider
+   * of the same account directory has closed (see `teardowns`).
    */
   static async open(options: TelegramProviderOptions): Promise<TelegramProvider> {
     const { accountId, configDir, stateDir } = options;
     const creds = await loadAppCredentials(configDir);
     const record = await readSessionRecord(accountId, configDir);
     if (!record) {
-      throw new Error(`Telegram account ${accountId} has no stored session; connect it again.`);
+      throw new SyncError(
+        "auth",
+        `Telegram account ${accountId} has no stored session; connect it again.`,
+        { remediation: REVOKED_REMEDIATION },
+      );
     }
     if (!record.session || record.revokedAt) {
-      throw new Error(
+      throw new SyncError(
+        "auth",
         `Telegram ended the session for account ${accountId}; re-authenticate it to sign in again.`,
+        { remediation: REVOKED_REMEDIATION },
       );
     }
     if (record.apiId !== String(creds.apiId)) {
@@ -130,6 +173,7 @@ export class TelegramProvider {
     }
     const key = readTelegramStoreKey(configDir);
     let archive: TelegramArchive | undefined;
+    let provider: TelegramProvider | undefined;
     try {
       archive = TelegramArchive.open(stateDir, key);
       // The adapter keeps its own copy for as long as it may reopen the cache.
@@ -138,14 +182,16 @@ export class TelegramProvider {
         { dir: stateDir, key: key ? Buffer.from(key) : null },
         options.device ?? telegramDeviceInfo(),
       );
-      const provider = new TelegramProvider(options, archive, adapter, record);
+      provider = new TelegramProvider(options, archive, adapter, record);
       // Before the updates loop starts: its catch-up raises newest_seen_id,
       // and the gap floors must sit below whatever the downtime lost.
       provider.checkDowntime();
       provider.connecting = provider.connect();
       return provider;
     } catch (err) {
-      archive?.close();
+      // A provider that was built holds the directory's teardown slot.
+      if (provider) await provider.dispose().catch(() => undefined);
+      else archive?.close();
       throw err;
     } finally {
       key?.fill(0);
@@ -204,10 +250,17 @@ export class TelegramProvider {
   async ensureUsable(signal?: AbortSignal): Promise<void> {
     if (this.revokedReason) return this.failRevoked();
     if (this.suspended) throw new SyncError("network", "The Telegram connection is paused.");
-    let outcome = await withTimeout(this.connecting ?? this.reconnect(), CONNECT_TIMEOUT_MS);
-    if (outcome && !outcome.ok && !this.revokedReason) {
+    let outcome = await withTimeout(
+      this.connecting ?? this.reconnect(),
+      CONNECT_TIMEOUT_MS,
+      signal,
+    );
+    if (outcome && !outcome.ok && !this.revokedReason && !signal?.aborted) {
       // The first attempt failed for a reason that may have cleared.
-      outcome = await withTimeout(this.reconnect(), CONNECT_TIMEOUT_MS);
+      outcome = await withTimeout(this.reconnect(), CONNECT_TIMEOUT_MS, signal);
+    }
+    if (!outcome && signal?.aborted) {
+      throw new SyncError("network", "The Telegram sync was cancelled while connecting.");
     }
     if (this.revokedReason) return this.failRevoked();
     if (!outcome) {
@@ -264,8 +317,24 @@ export class TelegramProvider {
     await this.adapter.resume();
   }
 
+  /**
+   * A source built on this context; the returned release disposes the
+   * context once every source built on it has been released. A host rebuild
+   * builds a new context for the new source, so the old source's release is
+   * what closes the old client.
+   */
+  attach(): () => Promise<void> {
+    this.attached++;
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      if (--this.attached === 0) await this.dispose();
+    };
+  }
+
   async dispose(): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed) return this.whenClosed;
     this.disposed = true;
     this.unsubscribeUpdates();
     try {
@@ -275,11 +344,17 @@ export class TelegramProvider {
     } finally {
       await this.revocationWrite;
       this.archive.close();
+      this.closed();
     }
   }
 
   private async connect(): Promise<ConnectOutcome> {
     try {
+      // Never two clients on one auth key (see `teardowns`).
+      await this.predecessor;
+      if (this.disposed) {
+        return { ok: false, error: new TelegramError("cancelled", "Closed before connecting") };
+      }
       const self = await this.adapter.connect({ session: this.record.session });
       if (this.disposed) {
         return { ok: false, error: new TelegramError("cancelled", "Closed while connecting") };
@@ -469,7 +544,8 @@ export class TelegramProvider {
     );
   }
 
-  private syncErrorFrom(err: unknown): SyncError {
+  /** Any failure of a request this account made, as the host's sync error. */
+  syncErrorFrom(err: unknown): SyncError {
     if (err instanceof SyncError) return err;
     if (err instanceof TelegramError) {
       switch (err.code) {
@@ -495,16 +571,26 @@ export class TelegramProvider {
   }
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+/** `promise`, or `undefined` once `ms` pass or `signal` aborts, whichever is first. */
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  signal?: AbortSignal,
+): Promise<T | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), ms);
+        // Already aborted: a macrotask later, so a settled `promise` still wins.
+        timer = setTimeout(() => resolve(undefined), signal?.aborted ? 0 : ms);
+        onAbort = () => resolve(undefined);
+        signal?.addEventListener("abort", onAbort, { once: true });
       }),
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
   }
 }

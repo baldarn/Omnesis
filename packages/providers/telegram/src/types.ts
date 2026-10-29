@@ -49,6 +49,8 @@ export interface StoredMessage {
   mediaLastError?: string;
   /** A voice note's transcript; `""` when it held no speech. */
   transcript?: string;
+  /** Unix seconds this message last changed after it was archived (edit, transcript, topic rename). */
+  changedAt?: number;
   /** An attachment's extraction, re-emitted on every render of its day. */
   extraction?: ExtractionResult;
   /**

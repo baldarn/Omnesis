@@ -41,7 +41,14 @@ import {
 } from "./media-retry.js";
 import type { ExtractionResult } from "@omnesis/core";
 import type { LocalStoreProbeResult } from "@omnesis/source-sdk";
-import type { ChatKind, MessageBox, TgChat, TgDialog, TgUser } from "./client/types.js";
+import type {
+  ChatKind,
+  MessageBox,
+  TakeoutScope,
+  TgChat,
+  TgDialog,
+  TgUser,
+} from "./client/types.js";
 import type { MediaDescriptor, StoredChat, StoredMessage, WalkState } from "./types.js";
 
 const log = createLogger("source:telegram-messages").child("store");
@@ -49,7 +56,7 @@ const log = createLogger("source:telegram-messages").child("store");
 const ARCHIVE_FILE = "archive.db";
 const ARCHIVE_LABEL = "Telegram message archive";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -110,6 +117,7 @@ CREATE TABLE IF NOT EXISTS messages (
   media_last_error TEXT,
   extract_rev INTEGER NOT NULL DEFAULT 0,
   media_extract_json TEXT,
+  changed_at INTEGER,
   PRIMARY KEY (chat_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS messages_by_chat_ts ON messages(chat_id, ts);
@@ -127,6 +135,8 @@ CREATE TABLE IF NOT EXISTS dirty_days (
   chat_id INTEGER NOT NULL,
   date TEXT NOT NULL,
   emit_seq INTEGER,
+  render_failures INTEGER NOT NULL DEFAULT 0,
+  retry_at INTEGER,
   PRIMARY KEY (chat_id, date)
 );
 CREATE INDEX IF NOT EXISTS dirty_days_emit_seq ON dirty_days(emit_seq);
@@ -159,7 +169,13 @@ const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]
   ["emitted_attachments", "retired_seq", "INTEGER"],
   ["messages", "media_extract_json", "TEXT"],
   ["chats", "topics_listed_at", "INTEGER"],
+  ["messages", "changed_at", "INTEGER"],
+  ["dirty_days", "render_failures", "INTEGER NOT NULL DEFAULT 0"],
+  ["dirty_days", "retry_at", "INTEGER"],
 ];
+
+/** The longest a day whose render keeps failing waits before it is tried again. */
+const RENDER_RETRY_MAX_S = 6 * 3600;
 
 /** The media kinds a message is enrolled in the media lifecycle for (`media-retry.ts`). */
 const PROCESSABLE_KINDS_SQL = "'voice', 'photo', 'document'";
@@ -241,6 +257,12 @@ export interface DrainedDay {
   messages: StoredMessage[];
   /** Attachment ids emitted for this day earlier and not yet retired. */
   ledger: string[];
+  /**
+   * Unix seconds the day's archived content last changed after it was first
+   * archived (an edit, a deletion, a transcript, a topic renamed), counting
+   * deleted messages too; absent when it never did.
+   */
+  changedAt?: number;
 }
 
 export interface DrainResult {
@@ -300,6 +322,7 @@ interface MessageRow {
   media_last_error: string | null;
   transcript: string | null;
   media_extract_json: string | null;
+  changed_at: number | null;
 }
 
 /** The UTC calendar day a unix-seconds timestamp falls on, `YYYY-MM-DD`. */
@@ -311,7 +334,6 @@ export class TelegramArchive {
   readonly storeId: string;
   private closed = false;
   private readonly now: () => number;
-  private emitSeqCounter: number;
 
   private constructor(
     private readonly db: Db,
@@ -325,11 +347,21 @@ export class TelegramArchive {
     db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('store_id', ?)").run(randomUUID());
     this.setMeta("schema_version", String(SCHEMA_VERSION));
     this.storeId = this.getMeta("store_id")!;
+  }
+
+  /**
+   * The last `emitSeq` issued, read inside the drain's transaction: two
+   * handles can be open on one archive while a rebuilt context replaces the
+   * old one, so a counter cached per handle could issue a value twice.
+   */
+  private emitSeqCounter(): number {
     const fromMeta = Number.parseInt(this.getMeta("emit_seq_counter") ?? "0", 10) || 0;
     const fromRows = (
-      db.prepare("SELECT COALESCE(MAX(emit_seq), 0) AS m FROM dirty_days").get() as { m: number }
+      this.db.prepare("SELECT COALESCE(MAX(emit_seq), 0) AS m FROM dirty_days").get() as {
+        m: number;
+      }
     ).m;
-    this.emitSeqCounter = Math.max(fromMeta, fromRows);
+    return Math.max(fromMeta, fromRows);
   }
 
   /**
@@ -796,9 +828,9 @@ export class TelegramArchive {
     if (!row) return false;
     this.db
       .prepare(
-        "UPDATE messages SET deleted = 1, deleted_at = ? WHERE chat_id = ? AND msg_id = ? AND box = ?",
+        "UPDATE messages SET deleted = 1, deleted_at = ?, changed_at = ? WHERE chat_id = ? AND msg_id = ? AND box = ?",
       )
-      .run(this.now(), chatId, msgId, box);
+      .run(this.now(), this.now(), chatId, msgId, box);
     this.markDirty(chatId, messageDate(row.ts));
     return true;
   }
@@ -878,6 +910,7 @@ export class TelegramArchive {
       .prepare("SELECT deleted FROM messages WHERE chat_id = ? AND msg_id = ?")
       .get(m.chatId, m.msgId) as { deleted: number };
     if (deleted.deleted === 1) return false;
+    if (exists) this.touch("chat_id = ? AND msg_id = ?", m.chatId, m.msgId);
     this.markDirty(m.chatId, messageDate(m.ts));
     return true;
   }
@@ -905,6 +938,16 @@ export class TelegramArchive {
   /** Messages skipped because another chat held their id (see `collides`). */
   idCollisionCount(): number {
     return this.metaNumber("id_collisions") ?? 0;
+  }
+
+  /** Record that archived content changed now (`sourceUpdatedAt` moves with it). */
+  private touch(where: string, ...params: unknown[]): void {
+    this.db.prepare(`UPDATE messages SET changed_at = ? WHERE ${where}`).run(this.now(), ...params);
+  }
+
+  /** Unix seconds, on the archive's clock. */
+  clock(): number {
+    return this.now();
   }
 
   private markDirty(chatId: number, date: string): void {
@@ -1104,6 +1147,10 @@ export class TelegramArchive {
       for (const topic of topics) {
         if (current.get(topic.id) === topic.title) continue;
         upsert.run(chatId, topic.id, topic.title);
+        // A rename changes days already published; a first title only fills them in.
+        if (current.has(topic.id)) {
+          this.touch("chat_id = ? AND topic_id = ? AND deleted = 0", chatId, topic.id);
+        }
         changed += markDays.run(chatId, topic.id).changes > 0 ? 1 : 0;
       }
       this.db
@@ -1145,12 +1192,39 @@ export class TelegramArchive {
   setTakeoutState(state: TakeoutState, retryAfterS?: number): void {
     this.db.transaction(() => {
       this.setMeta("takeout_state", state);
+      // Only an active export has a session to resume.
+      if (state !== "active") this.deleteMeta("takeout_session");
       if (retryAfterS !== undefined) {
         this.setMeta("takeout_retry_at", String(this.now() + retryAfterS));
       } else {
         this.deleteMeta("takeout_retry_at");
       }
     })();
+  }
+
+  /**
+   * An export session is open: kept with its id and scope, so a rebuilt
+   * context or a restart resumes it rather than asking Telegram for another.
+   */
+  setTakeoutActive(id: string, scope: TakeoutScope): void {
+    this.db.transaction(() => {
+      this.setTakeoutState("active");
+      this.setMeta("takeout_session", JSON.stringify({ id, scope }));
+    })();
+  }
+
+  /** The open export session to resume, while the export is active. */
+  takeoutSession(): { id: string; scope: TakeoutScope } | undefined {
+    const raw = this.getMeta("takeout_session");
+    if (!raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw) as { id?: unknown; scope?: TakeoutScope };
+      return typeof parsed.id === "string" && parsed.scope
+        ? { id: parsed.id, scope: parsed.scope }
+        : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** A resync: a held-back export is asked for again on the next walk. */
@@ -1173,16 +1247,18 @@ export class TelegramArchive {
    * nothing acknowledged.
    */
   drain(opts: { committedSeq: number; limit: number }): DrainResult {
-    const committedSeq =
-      Number.isSafeInteger(opts.committedSeq) &&
-      opts.committedSeq >= 0 &&
-      opts.committedSeq <= this.emitSeqCounter
-        ? opts.committedSeq
-        : 0;
-    const emitSeq = this.emitSeqCounter + 1;
     const days: DrainedDay[] = [];
     let morePending = false;
+    let emitSeq = 0;
     this.db.transaction(() => {
+      const issued = this.emitSeqCounter();
+      const committedSeq =
+        Number.isSafeInteger(opts.committedSeq) &&
+        opts.committedSeq >= 0 &&
+        opts.committedSeq <= issued
+          ? opts.committedSeq
+          : 0;
+      emitSeq = issued + 1;
       this.db
         .prepare("DELETE FROM dirty_days WHERE emit_seq IS NOT NULL AND emit_seq <= ?")
         .run(committedSeq);
@@ -1192,12 +1268,14 @@ export class TelegramArchive {
         )
         .run(committedSeq);
       this.prunePendingDeletions();
+      // A day whose render failed waits out its backoff (see `quarantineDay`).
       const rows = this.db
         .prepare(
-          `SELECT chat_id, date FROM dirty_days WHERE emit_seq IS NULL OR emit_seq > ?
+          `SELECT chat_id, date FROM dirty_days
+           WHERE (emit_seq IS NULL OR emit_seq > ?) AND (retry_at IS NULL OR retry_at <= ?)
            ORDER BY date DESC, chat_id ASC LIMIT ?`,
         )
-        .all(committedSeq, opts.limit + 1) as { chat_id: number; date: string }[];
+        .all(committedSeq, this.now(), opts.limit + 1) as { chat_id: number; date: string }[];
       morePending = rows.length > opts.limit;
       const stamp = this.db.prepare(
         "UPDATE dirty_days SET emit_seq = ? WHERE chat_id = ? AND date = ?",
@@ -1206,13 +1284,19 @@ export class TelegramArchive {
         `SELECT * FROM messages WHERE chat_id = ? AND ts >= ? AND ts < ? AND deleted = 0
          ORDER BY ts ASC, msg_id ASC`,
       );
+      const selectChanged = this.db.prepare(
+        "SELECT MAX(changed_at) AS c FROM messages WHERE chat_id = ? AND ts >= ? AND ts < ?",
+      );
       const selectLedger = this.db.prepare(
         "SELECT external_id FROM emitted_attachments WHERE chat_id = ? AND date = ? ORDER BY external_id",
       );
       for (const { chat_id, date } of rows.slice(0, opts.limit)) {
         stamp.run(emitSeq, chat_id, date);
         const start = Date.parse(`${date}T00:00:00.000Z`) / 1000;
+        const changed = (selectChanged.get(chat_id, start, start + 86_400) as { c: number | null })
+          .c;
         days.push({
+          ...(changed !== null ? { changedAt: changed } : {}),
           chatId: chat_id,
           date,
           messages: (selectDay.all(chat_id, start, start + 86_400) as MessageRow[]).map(
@@ -1223,10 +1307,42 @@ export class TelegramArchive {
           ),
         });
       }
-      this.emitSeqCounter = emitSeq;
       this.setMeta("emit_seq_counter", String(emitSeq));
     })();
     return { days, emitSeq, morePending };
+  }
+
+  /**
+   * A drained day whose render failed: kept dirty, unstamped so this page's
+   * acknowledgement cannot clear it, and held back on a doubling backoff so
+   * the other days keep publishing. Returns how many times it has failed.
+   */
+  quarantineDay(chatId: number, date: string): number {
+    const row = this.db
+      .prepare(
+        `UPDATE dirty_days SET emit_seq = NULL, render_failures = render_failures + 1
+         WHERE chat_id = ? AND date = ? RETURNING render_failures AS f`,
+      )
+      .get(chatId, date) as { f: number } | undefined;
+    const failures = row?.f ?? 1;
+    const delay = Math.min(60 * 2 ** (failures - 1), RENDER_RETRY_MAX_S);
+    this.db
+      .prepare("UPDATE dirty_days SET retry_at = ? WHERE chat_id = ? AND date = ?")
+      .run(this.now() + delay, chatId, date);
+    return failures;
+  }
+
+  /** Days whose last render failed and that wait to be tried again (a stamped one rendered). */
+  quarantinedDayCount(): number {
+    return (
+      this.db
+        .prepare(
+          "SELECT COUNT(*) AS c FROM dirty_days WHERE render_failures > 0 AND emit_seq IS NULL",
+        )
+        .get() as {
+        c: number;
+      }
+    ).c;
   }
 
   /**
@@ -1299,7 +1415,12 @@ export class TelegramArchive {
     };
     switch (outcome.kind) {
       case "transcribed":
-        settle(outcome.text === "" ? "empty" : "done", ", transcript = ?", outcome.text);
+        settle(
+          outcome.text === "" ? "empty" : "done",
+          ", transcript = ?, changed_at = ?",
+          outcome.text,
+          now,
+        );
         return;
       case "extracted":
         if (outcome.complete) {
@@ -1556,6 +1677,7 @@ function toStoredMessage(r: MessageRow): StoredMessage {
     ...(r.media_extract_json !== null
       ? { extraction: JSON.parse(r.media_extract_json) as ExtractionResult }
       : {}),
+    ...(r.changed_at !== null && r.changed_at !== undefined ? { changedAt: r.changed_at } : {}),
   };
 }
 
@@ -1588,10 +1710,13 @@ function scopeParams(scope: MediaScope): {
   };
 }
 
-/** The name a user goes by: first and last name, else the username, else the id. */
-function displayName(u: Pick<TgUser, "id" | "firstName" | "lastName" | "username">): string {
+/**
+ * The name a user goes by: first and last name, else the username, else
+ * nothing (an id is not a name; the render falls back to the message's own).
+ */
+function displayName(u: Pick<TgUser, "firstName" | "lastName" | "username">): string {
   const name = [u.firstName, u.lastName].filter(Boolean).join(" ").trim();
-  return name || (u.username ? `@${u.username}` : String(u.id));
+  return name || (u.username ? `@${u.username}` : "");
 }
 
 /** The doctor's view of both of an account's local stores. */

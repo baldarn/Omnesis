@@ -134,9 +134,10 @@ export interface WalkOutcome {
 }
 
 /**
- * Where the open takeout session is kept: on the account's context, so a
- * source rebuilt by a config change reuses it instead of asking Telegram for
- * another export.
+ * Where the open takeout session is kept: on the account's context. A
+ * rebuilt context (a config change, a re-authentication) or a restart starts
+ * with none and resumes the session by the id the archive keeps, so neither
+ * asks Telegram for another export.
  */
 export interface TakeoutHolder {
   takeout: TelegramTakeout | undefined;
@@ -237,7 +238,7 @@ export class HistoryWalker {
       )) {
         await this.perChat(chat, () => this.presence(ctx, chat));
       }
-      await this.finishTakeout();
+      await this.finishTakeout(budget.signal);
       return { stop: "complete", requests: ctx.requests };
     } catch (err) {
       if (err instanceof Stop) return { stop: err.reason, requests: ctx.requests };
@@ -380,6 +381,14 @@ export class HistoryWalker {
     if (!holder) return this.adapter;
     if (holder.takeout) return inScope(chat, holder.takeout.scope) ? holder.takeout : this.adapter;
     const { state, retryAt } = this.archive.takeoutState();
+    const kept = state === "active" ? this.archive.takeoutSession() : undefined;
+    if (kept) {
+      // No request: the session is Telegram's, and outlives this client. One
+      // Telegram stopped honouring fails its first read as `TakeoutLost`.
+      holder.takeout = await this.adapter.takeout(kept.scope, { resumeId: kept.id });
+      log.info("Resuming the Telegram data export session");
+      return inScope(chat, kept.scope) ? holder.takeout : this.adapter;
+    }
     if (state === "done" || state === "unavailable") return this.adapter;
     if (state === "delayed" && retryAt !== undefined && retryAt * 1000 > this.clock.now()) {
       return this.adapter;
@@ -387,7 +396,10 @@ export class HistoryWalker {
     const scope = takeoutScopeOf(this.policy);
     const opened = await this.request(ctx, async () => {
       try {
-        return await this.adapter.takeout(scope);
+        return await this.adapter.takeout(
+          scope,
+          ctx.budget.signal ? { signal: ctx.budget.signal } : undefined,
+        );
       } catch (err) {
         if (err instanceof TelegramError && err.code === "takeout") return err;
         if (err instanceof TelegramError && TAKEOUT_REFUSALS.has(err.code)) return err;
@@ -408,7 +420,7 @@ export class HistoryWalker {
       return this.adapter;
     }
     holder.takeout = opened;
-    this.archive.setTakeoutState("active");
+    this.archive.setTakeoutActive(opened.id, opened.scope);
     log.info("Walking Telegram history through a data export session");
     return inScope(chat, opened.scope) ? opened : this.adapter;
   }
@@ -425,7 +437,7 @@ export class HistoryWalker {
    * the owner's devices of a new export. An export still held back when the
    * walk finished without it is settled the same way.
    */
-  private async finishTakeout(): Promise<void> {
+  private async finishTakeout(signal: AbortSignal | undefined): Promise<void> {
     if (!this.takeout) return;
     const { pending, walking } = this.archive.walkSummary();
     if (pending + walking > 0) return;
@@ -435,16 +447,28 @@ export class HistoryWalker {
     this.dropTakeout("done");
     if (!session) return;
     try {
-      await session.finish(true);
+      await session.finish(true, signal ? { signal } : undefined);
       log.info("Finished the Telegram data export");
     } catch (err) {
       log.warn(`Finishing the Telegram data export failed: ${toErrorMessage(err)}`);
     }
   }
 
+  /**
+   * Ask Telegram again for the recent ids of a chat after a gap. An id it
+   * answers with nothing was deleted, and a newer edit date is an edit the
+   * gap swallowed. Only a conclusive answer deletes anything: one whose
+   * entries do not line up with the ids asked for, or one that answers
+   * nothing for a whole batch of a chat whose history no longer reads (access
+   * lost, rather than everything deleted), ends the check for this chat
+   * without deleting; the next reconcile asks again. A failed request deletes
+   * nothing either: the batch commits only after a usable answer.
+   */
   private async presence(ctx: RunContext, start: ChatProgress): Promise<void> {
     const since = Math.floor(this.clock.now() / 1000) - RECONCILE_WINDOW_DAYS * 86_400;
     const box = boxOf(start);
+    const signal = ctx.budget.signal;
+    const opts = signal ? { signal } : undefined;
     for (;;) {
       const chat = this.archive.getChat(start.chatId);
       if (!chat || chat.lastPresenceCheckAt !== undefined) return;
@@ -454,20 +478,32 @@ export class HistoryWalker {
         chat.presenceAfterId ?? 0,
         PRESENCE_BATCH_SIZE,
       );
-      if (ids.length === 0) {
+      const settle = (): void =>
         this.archive.commitPresence(chat.chatId, {
           missingIds: [],
           current: [],
           users: [],
           nextAfterId: null,
         });
-        return;
-      }
+      if (ids.length === 0) return settle();
       const found = await this.request(ctx, () =>
         box === "common"
-          ? this.adapter.getMessagesCommon(ids)
-          : this.adapter.getMessages(chat.chatId, ids),
+          ? this.adapter.getMessagesCommon(ids, opts)
+          : this.adapter.getMessages(chat.chatId, ids, opts),
       );
+      const aligned = found.length === ids.length && found.every((m, i) => !m || m.id === ids[i]);
+      if (!aligned) {
+        log.warn(
+          `Presence check of Telegram chat ${chat.chatId} got an answer that does not match the ids asked; deleting nothing`,
+        );
+        return settle();
+      }
+      if (found.every((m) => !m) && !(await this.stillReadable(ctx, chat.chatId, ids))) {
+        log.warn(
+          `Presence check of Telegram chat ${chat.chatId} found none of ${ids.length} recent messages and the chat does not read; deleting nothing`,
+        );
+        return settle();
+      }
       const missingIds = ids.filter((_, i) => !found[i]);
       const current = found
         .filter((m): m is TgMessage => !!m && m.chatId === chat.chatId)
@@ -485,6 +521,33 @@ export class HistoryWalker {
         );
       }
     }
+  }
+
+  /**
+   * Whether a chat's history still reads, for a presence batch that came back
+   * entirely empty: its newest page holds a message, and not one of the ids
+   * Telegram just called gone. A refusal means it does not.
+   */
+  private async stillReadable(
+    ctx: RunContext,
+    chatId: number,
+    asked: readonly number[],
+  ): Promise<boolean> {
+    let page: { messages: TgMessage[] };
+    try {
+      page = await this.request(ctx, () =>
+        this.adapter.getHistory(chatId, {
+          offsetId: 0,
+          limit: 1,
+          ...(ctx.budget.signal ? { signal: ctx.budget.signal } : {}),
+        }),
+      );
+    } catch (err) {
+      if (err instanceof ChatRefused) return false;
+      throw err;
+    }
+    const gone = new Set(asked);
+    return page.messages.length > 0 && !page.messages.some((m) => gone.has(m.id));
   }
 
   /** What of a page the archive keeps: within the cutoff, through the extractor. */

@@ -12,7 +12,7 @@
  */
 
 import { join } from "node:path";
-import { DEFAULT_CONFIG_DIR, normalizePhone, resolveAttachmentConfig } from "@omnesis/core";
+import { normalizePhone, resolveAttachmentConfig } from "@omnesis/core";
 import {
   config,
   defineProvider,
@@ -20,7 +20,7 @@ import {
   type ProviderDefinition,
 } from "@omnesis/source-sdk";
 import { safePathSegment } from "@omnesis/types";
-import { loginFlow } from "./auth.js";
+import { loginFlow, removeConnectedAccount } from "./auth.js";
 import { telegramCredentialsSpec } from "./credentials-spec.js";
 import { telegramDocumentEventProfile } from "./document-event-profile.js";
 import { HISTORY_MIN_INTERVAL_MS, WALK_REQUESTS_PER_PAGE } from "./limits.js";
@@ -28,7 +28,7 @@ import { TelegramMessagesSource } from "./messages.js";
 import { telegramIcon } from "./icons.js";
 import { inspectTelegramStores } from "./message-store.js";
 import { TelegramProvider } from "./provider.js";
-import { listSessionAccounts, readSessionRecord, removeAccount } from "./session-store.js";
+import { listSessionAccounts, readSessionRecord } from "./session-store.js";
 import { telegramStateSpec } from "./state.js";
 import type { AdapterFactory } from "./client/types.js";
 import type { TelegramSyncCursor } from "./types.js";
@@ -85,6 +85,13 @@ async function describeAccount(id: string, configDir: string): Promise<AccountDe
   };
 }
 
+/** The config root a lifecycle call names; every host passes one. */
+function requireConfigDir(configDir: string | undefined): string {
+  if (!configDir)
+    throw new Error("The Telegram source needs a host that names its config directory.");
+  return configDir;
+}
+
 /** A validated config number (the host has already checked its range). */
 function positiveInt(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
@@ -97,14 +104,17 @@ export function buildTelegramProvider(
     provider: { id: TELEGRAM_PROVIDER_ID, name: "Telegram" },
     authType: "qr",
     experimental: true,
-    // Two collectors on one session string trip AUTH_KEY_DUPLICATED and
-    // would keep two diverging archives.
+    // Exclusive, because the other modes cannot work: the archive is local to
+    // its host and the cursor is bound to that archive's storeId, so a
+    // handoff would hand a cursor no other host can resume; and Telegram's
+    // cloud already holds the authoritative copy every host would read, so a
+    // replica adds nothing but a second session on the account.
     multiDevice: { mode: "exclusive" },
     credentials: telegramCredentialsSpec,
     contract: { apiVersion: 2, requires: ["state-envelope", "scoped-host", "typed-config"] },
 
     async discover(ctx) {
-      const configDir = ctx?.configDir ?? DEFAULT_CONFIG_DIR;
+      const configDir = requireConfigDir(ctx?.configDir);
       return Promise.all(
         listSessionAccounts(configDir).map((id) => describeAccount(id, configDir)),
       );
@@ -115,7 +125,11 @@ export function buildTelegramProvider(
     },
 
     async cleanupCredentials(accountId, ctx) {
-      await removeAccount(accountId, ctx?.configDir ?? DEFAULT_CONFIG_DIR);
+      const configDir = requireConfigDir(ctx?.configDir);
+      await removeConnectedAccount(accountId, configDir, {
+        factory: await loadFactory(),
+        stateDir: accountDir(configDir, accountId),
+      });
     },
 
     async createContext({ accountId, host }) {
@@ -208,6 +222,9 @@ export function buildTelegramProvider(
               minIntervalMs: positiveInt(options?.historyMinIntervalMs, HISTORY_MIN_INTERVAL_MS),
             },
           });
+          // The context closes when its last source is disposed: a rebuild
+          // gives the new source a new context, so this is what closes the old one.
+          const release = provider.attach();
           return Promise.resolve({
             icon: telegramIcon,
             sync: (cursor, opts) => source.sync(cursor as TelegramSyncCursor | null, opts),
@@ -222,7 +239,7 @@ export function buildTelegramProvider(
               ),
             async dispose() {
               source.dispose();
-              await provider.dispose();
+              await release();
             },
           });
         },

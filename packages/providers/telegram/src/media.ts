@@ -142,6 +142,7 @@ export class MediaPass {
         const text = transcript.text.trim();
         this.record(m, { kind: "transcribed", text });
         m.transcript = text;
+        m.changedAt = this.deps.archive.clock();
         m.transcription = text === "" ? "no-speech" : undefined;
       } catch (err) {
         if (day.signal?.aborted) {

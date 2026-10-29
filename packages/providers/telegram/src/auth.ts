@@ -19,8 +19,9 @@ import { AuthFailure, config, type AuthResult, type AuthSession } from "@omnesis
 import { TELEGRAM_FILE_KEY, loadAppCredentials } from "./credentials-spec.js";
 import { telegramDeviceInfo } from "./device.js";
 import { isAppCredentialRejected } from "./client/errors.js";
-import { LOGIN_TIMEOUT_MS, MAX_PASSWORD_ATTEMPTS } from "./limits.js";
-import { readSessionRecord, writeSessionRecord } from "./session-store.js";
+import { LOGIN_TIMEOUT_MS, LOGOUT_TIMEOUT_MS, MAX_PASSWORD_ATTEMPTS } from "./limits.js";
+import { accountClosed } from "./provider.js";
+import { readSessionRecord, removeAccount, writeSessionRecord } from "./session-store.js";
 import {
   TelegramError,
   type AdapterFactory,
@@ -155,6 +156,68 @@ export async function loginFlow(session: AuthSession, deps: LoginDeps): Promise<
   }
 }
 
+export interface RemoveAccountDeps {
+  factory: AdapterFactory;
+  /** The account directory, whose live client must close before the logout. */
+  stateDir: string;
+  device?: DeviceInfo;
+  timeoutMs?: number;
+}
+
+/**
+ * Remove a connected account: end its authorization at Telegram, then delete
+ * its directory (the credential, the archive and the cache).
+ *
+ * The record is read first, and a record that cannot be read (a locked
+ * keyring) leaves everything in place and throws: deleting it would strand a
+ * live authorization nobody could end from here. Once read, the directory is
+ * always removed; a logout that failed or timed out is reported afterwards,
+ * so the operator can end the session in Telegram's device list.
+ */
+export async function removeConnectedAccount(
+  accountId: string,
+  configDir: string,
+  deps: RemoveAccountDeps,
+): Promise<void> {
+  const record = await readSessionRecord(accountId, configDir);
+  let failure: string | undefined;
+  if (record?.session && !record.revokedAt) {
+    const timeoutMs = deps.timeoutMs ?? LOGOUT_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(new Error("Ending the Telegram session timed out")),
+      timeoutMs,
+    );
+    let auth: ReturnType<AdapterFactory["auth"]> | undefined;
+    try {
+      // The source was unregistered first; its client may still be closing.
+      await Promise.race([
+        accountClosed(deps.stateDir),
+        new Promise((resolve) => controller.signal.addEventListener("abort", resolve)),
+      ]);
+      controller.signal.throwIfAborted();
+      const creds = await loadAppCredentials(configDir);
+      auth = deps.factory.auth(creds, deps.device ?? telegramDeviceInfo());
+      await auth.logOutSession(record.session, { signal: controller.signal });
+      log.info(`Ended the Telegram session of account ${accountId}`);
+    } catch (err) {
+      failure = controller.signal.aborted ? "timed out" : toErrorMessage(err);
+    } finally {
+      clearTimeout(timer);
+      await auth
+        ?.close()
+        .catch((err) => log.debug(`Sign-out client close failed: ${toErrorMessage(err)}`));
+    }
+  }
+  await removeAccount(accountId, configDir);
+  if (failure) {
+    log.warn(`Removed Telegram account ${accountId}; ending its session failed: ${failure}`);
+    throw new Error(
+      `Telegram account ${accountId} was removed here, but its Telegram session could not be ended (${failure}). End it in Telegram under Settings → Devices.`,
+    );
+  }
+}
+
 async function logOutQuietly(auth: { logOut(): Promise<void> }): Promise<void> {
   try {
     await auth.logOut();
@@ -192,9 +255,36 @@ function toAuthFailure(err: unknown, timedOut: boolean): Error {
     case "cancelled":
       return new AuthFailure("cancelled", "The Telegram sign-in was cancelled.");
     default:
-      if (err.detail?.rpc === "AUTH_TOKEN_EXPIRED") {
-        return new AuthFailure("challenge-expired", "The Telegram sign-in code expired.");
-      }
-      return new AuthFailure("unknown", `Telegram sign-in failed: ${err.message}`);
+      return refusalFailure(err);
   }
+}
+
+/** Telegram refused the account itself: signing in again will not change that. */
+const ACCOUNT_REFUSALS = /^(USER_DEACTIVATED(_BAN)?|PHONE_NUMBER_BANNED)$/u;
+
+/**
+ * A definitive refusal, by its RPC text. A banned or deactivated account is
+ * `denied` (it never clears by asking again); any other refusal of the
+ * account, phone or authorization is `credential-rejected`, which a fresh
+ * sign-in may get past. Only what names none of these stays `unknown`.
+ */
+function refusalFailure(err: TelegramError): AuthFailure {
+  const rpc = err.detail?.rpc ?? "";
+  if (rpc === "AUTH_TOKEN_EXPIRED") {
+    return new AuthFailure("challenge-expired", "The Telegram sign-in code expired.");
+  }
+  if (/_FLOOD$/u.test(rpc)) {
+    return new AuthFailure("unavailable", `Telegram asked to wait before signing in (${rpc}).`);
+  }
+  if (ACCOUNT_REFUSALS.test(rpc)) {
+    return new AuthFailure("denied", `Telegram refused this account (${rpc}).`, {
+      remedy: "Check the account's status in the Telegram app; Omnesis cannot sign it in.",
+    });
+  }
+  if (err.code === "revoked" || /^(PHONE|AUTH)_/u.test(rpc)) {
+    return new AuthFailure("credential-rejected", `Telegram refused the sign-in (${rpc}).`, {
+      remedy: "Start the connection again and scan a fresh code.",
+    });
+  }
+  return new AuthFailure("unknown", `Telegram sign-in failed: ${err.message}`);
 }

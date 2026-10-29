@@ -619,9 +619,17 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
 
   getHistory(
     chatId: number,
-    opts: { offsetId: number; limit: number; minId?: number },
+    opts: { offsetId: number; limit: number; minId?: number; signal?: AbortSignal },
   ): Promise<{ messages: TgMessage[]; users: TgUser[] }> {
-    return this.request("getHistory", () => this.historyPage(chatId, opts), { chatId, ...opts });
+    const { signal, ...args } = opts;
+    return this.request(
+      "getHistory",
+      () => {
+        abortedCheck(signal);
+        return this.historyPage(chatId, args);
+      },
+      { chatId, ...args },
+    );
   }
 
   private historyPage(
@@ -642,26 +650,34 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
    * `finishTakeout` in `calls`. A chat outside the session's scope answers
    * `TAKEOUT_REQUIRED`, as Telegram does.
    */
-  async takeout(scope: TakeoutScope): Promise<TelegramTakeout> {
-    const generation = await this.request(
-      "initTakeout",
-      () => {
-        this.authorizeCurrent();
-        return this.server.openTakeout(scope);
-      },
-      scope,
-    );
+  async takeout(
+    scope: TakeoutScope,
+    opts?: { signal?: AbortSignal; resumeId?: string },
+  ): Promise<TelegramTakeout> {
+    const generation = opts?.resumeId
+      ? Number(opts.resumeId)
+      : await this.request(
+          "initTakeout",
+          () => {
+            abortedCheck(opts?.signal);
+            this.authorizeCurrent();
+            return this.server.openTakeout(scope);
+          },
+          scope,
+        );
     const valid = (): void => {
       if (this.server.validTakeout !== generation) {
         throw new TelegramError("takeout", "TAKEOUT_INVALID", { rpc: "TAKEOUT_INVALID" });
       }
     };
     return {
+      id: String(generation),
       scope,
-      getHistory: (chatId, opts) =>
+      getHistory: (chatId, page) =>
         this.request(
           "takeoutGetHistory",
           () => {
+            abortedCheck(page.signal);
             valid();
             const chat = this.server
               .account(this.authorizeCurrent())
@@ -669,14 +685,15 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
             if (chat && !inTakeoutScope(chat, scope)) {
               throw new TelegramError("takeout", "TAKEOUT_REQUIRED", { rpc: "TAKEOUT_REQUIRED" });
             }
-            return this.historyPage(chatId, opts);
+            return this.historyPage(chatId, page);
           },
-          { chatId, ...opts },
+          { chatId, offsetId: page.offsetId, limit: page.limit },
         ),
-      finish: (success) =>
+      finish: (success, finishOpts) =>
         this.request(
           "finishTakeout",
           () => {
+            abortedCheck(finishOpts?.signal);
             valid();
             this.server.validTakeout = 0;
           },
@@ -685,10 +702,15 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
     };
   }
 
-  getMessages(chatId: number, ids: number[]): Promise<(TgMessage | null)[]> {
+  getMessages(
+    chatId: number,
+    ids: number[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<(TgMessage | null)[]> {
     return this.request(
       "getMessages",
       () => {
+        abortedCheck(opts?.signal);
         const chat = this.server
           .account(this.authorizeCurrent())
           .chats?.find((c) => c.chat.id === chatId);
@@ -698,10 +720,11 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
     );
   }
 
-  getMessagesCommon(ids: number[]): Promise<(TgMessage | null)[]> {
+  getMessagesCommon(ids: number[], opts?: { signal?: AbortSignal }): Promise<(TgMessage | null)[]> {
     return this.request(
       "getMessagesCommon",
       () => {
+        abortedCheck(opts?.signal);
         const chats = this.server.account(this.authorizeCurrent()).chats ?? [];
         const common = chats.flatMap((c) => c.messages).filter((m) => m.box === "common");
         return ids.map((id) => common.find((m) => m.id === id) ?? null);
@@ -786,6 +809,11 @@ export class SimulatedTelegramAdapter implements TelegramAdapter {
   }
 }
 
+/** A cancelled request, classified as the real adapter classifies an abort. */
+function abortedCheck(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new TelegramError("cancelled", "The request was aborted");
+}
+
 /** Where a chat's ids live, as the real adapter reports it. */
 function chatBox(chat: TgChat): MessageBox {
   return chat.kind === "supergroup" || chat.kind === "forum" || chat.kind === "channel"
@@ -831,6 +859,13 @@ class SimulatedAuthAdapter implements TelegramAuthAdapter {
   async logOut(): Promise<void> {
     this.server.record("logOut");
     if (this.session) this.server.endSession(this.session);
+  }
+
+  async logOutSession(session: string, opts: { signal: AbortSignal }): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    opts.signal.throwIfAborted();
+    this.server.record("logOutSession", { session });
+    this.server.endSession(session);
   }
 
   async close(): Promise<void> {
