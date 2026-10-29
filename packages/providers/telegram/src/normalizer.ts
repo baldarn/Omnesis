@@ -19,6 +19,8 @@ import {
   computeContentHash,
   extractEmailsFromText,
   extractPhonesFromText,
+  isAutomatedSenderAddress,
+  isNonIdentifyingEmail,
   transcriptionPlaceholderNote,
 } from "@omnesis/core";
 import { servicePhrase } from "./message-extractor.js";
@@ -53,11 +55,28 @@ export interface DayRenderInput {
   sourceId: SourceId;
   /** For phones found in message text, which may be written nationally. */
   phoneRegion?: string;
+  /** Unix seconds the day last changed after it was archived, deleted messages included. */
+  changedAt?: number;
 }
 
 type PhoneRegion = Parameters<typeof extractPhonesFromText>[1];
 
 const GROUPISH = new Set(["group", "supergroup", "forum"]);
+
+/** Telegram's own service-notifications account (login codes, security notices). */
+const TELEGRAM_SERVICE_USER_ID = 777_000;
+
+/**
+ * A display name worth giving a person: cleaned, and not a phone number or a
+ * bare number, which some accounts carry as their name and which would name
+ * a person after a number rather than identify them by it.
+ */
+function personName(raw: string | undefined): string | undefined {
+  const name = cleanPersonName(raw);
+  if (!name) return undefined;
+  if (/^[\d\s+().-]+$/u.test(name) && /\d/u.test(name)) return undefined;
+  return name;
+}
 
 /**
  * How a Telegram user is identified to the people graph: their account LID,
@@ -130,7 +149,7 @@ export function normalizeDayChat(input: DayRenderInput): DocumentInput {
   const senderName = (m: Pick<StoredMessage, "outgoing" | "senderId" | "senderName">): string => {
     if (m.outgoing || m.senderId === self.id) return "You";
     const user = m.senderId !== undefined ? users.get(m.senderId) : undefined;
-    return user?.displayName ?? m.senderName ?? "Unknown";
+    return user?.displayName || m.senderName || "Unknown";
   };
 
   const topicOf = (m: StoredMessage): string | undefined =>
@@ -160,9 +179,10 @@ export function normalizeDayChat(input: DayRenderInput): DocumentInput {
     seen.add(userId);
     const user = users.get(userId);
     if (user?.isBot || user?.isDeleted) return;
-    // A channel or anonymous admin posts as the chat: not a person.
-    if (userId <= 0) return;
-    const name = cleanPersonName(user?.displayName ?? fallbackName);
+    // A channel or anonymous admin posts as the chat, and Telegram's service
+    // account sends notifications: neither is a person.
+    if (userId <= 0 || userId === TELEGRAM_SERVICE_USER_ID) return;
+    const name = personName(user?.displayName || fallbackName);
     const identifiers = telegramPersonIdentifiers(userId, users);
     if (user?.phoneE164) phones.add(user.phoneE164);
     people.push({ role: "participant", ...(name ? { name } : {}), identifiers });
@@ -178,7 +198,14 @@ export function normalizeDayChat(input: DayRenderInput): DocumentInput {
   for (const email of extractEmailsFromText(content)) {
     if (emails.has(email)) continue;
     emails.add(email);
-    people.push({ role: "mentioned", identifiers: [{ kind: "email", value: email }] });
+    // An address in a message names someone at most: never a new person,
+    // and never a no-reply or automated sender at all.
+    if (isNonIdentifyingEmail(email) || isAutomatedSenderAddress(email)) continue;
+    people.push({
+      role: "mentioned",
+      identifiers: [{ kind: "email", value: email }],
+      allowPersonCreation: false,
+    });
   }
   for (const phone of extractPhonesFromText(content, input.phoneRegion as PhoneRegion)) {
     if (phones.has(phone)) continue;
@@ -192,7 +219,11 @@ export function normalizeDayChat(input: DayRenderInput): DocumentInput {
 
   const first = messages[0];
   const created = first.ts;
-  const updated = Math.max(...messages.map((m) => Math.max(m.ts, m.editTs ?? 0)));
+  // The latest message, edit or later change (a transcript, a renamed topic,
+  // a deleted message, which `changedAt` counts); a loop, since a day can
+  // hold more messages than a spread may pass.
+  let updated = input.changedAt ?? 0;
+  for (const m of messages) updated = Math.max(updated, m.ts, m.editTs ?? 0, m.changedAt ?? 0);
   const links = telegramLinks(chat, first);
 
   return {

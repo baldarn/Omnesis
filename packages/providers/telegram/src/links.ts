@@ -4,15 +4,22 @@
 /**
  * Deep links for a day document (`docs/telegram-source.md` §8.4).
  *
- * Telegram has a public message link only for supergroups, forums and
- * channels: `t.me/<username>/<id>` when the chat is public, else
- * `t.me/c/<bare id>/<id>`, which opens for a member. A private chat links at
- * chat level through its username, the WhatsApp precedent. A private chat
- * without a username, a basic group and Saved Messages get no link: the
- * `tg://openmessage` scheme that could name them is undocumented and has not
- * been validated on a phone, so nothing is emitted rather than a link that
- * might open the wrong place. `appUrl` is only a native scheme: a `t.me`
- * message link is already a universal link, so it is the `sourceUrl` alone.
+ * Telegram has a message link only for supergroups, forums and channels.
+ * The link is always `t.me/c/<bare id>/<id>`: it names the chat by its id,
+ * which never changes, and opens for a member, which the account archiving
+ * it is. A `t.me/<username>/<id>` link would also open for a non-member, but
+ * a username can be dropped and claimed by another chat, and a stored link
+ * would then open someone else's chat.
+ *
+ * A private chat links at chat level through its username, the WhatsApp
+ * precedent; there is no id-based link to a user, so the same reclaim risk
+ * is accepted there (a username the person gave up and another account took
+ * opens that account). A private chat without a username, a basic group and
+ * Saved Messages get no link: the `tg://openmessage` scheme that could name
+ * them is undocumented and has not been validated on a phone, so nothing is
+ * emitted rather than a link that might open the wrong place. `appUrl` is
+ * only a native scheme: a `t.me` message link is already a universal link,
+ * so it is the `sourceUrl` alone.
  */
 
 import type { StoredChat } from "./types.js";
@@ -39,9 +46,7 @@ export function telegramLinks(
     case "forum":
     case "channel": {
       const thread = chat.kind === "forum" && first.topicId ? `${first.topicId}/` : "";
-      const url = chat.username
-        ? `https://t.me/${chat.username}/${thread}${first.msgId}`
-        : `https://t.me/c/${bareChannelId(chat.chatId)}/${thread}${first.msgId}`;
+      const url = `https://t.me/c/${bareChannelId(chat.chatId)}/${thread}${first.msgId}`;
       // An https t.me link already opens the Telegram app where it is installed.
       return { sourceUrl: url };
     }

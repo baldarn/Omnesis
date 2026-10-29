@@ -180,7 +180,11 @@ describe("normalizeDayChat", () => {
           { kind: "phone", value: "+12025550103" },
         ],
       },
-      { role: "mentioned", identifiers: [{ kind: "email", value: "sarah@example.org" }] },
+      {
+        role: "mentioned",
+        identifiers: [{ kind: "email", value: "sarah@example.org" }],
+        allowPersonCreation: false,
+      },
       {
         role: "mentioned",
         identifiers: [{ kind: "phone", value: "+12025550177" }],
@@ -191,6 +195,78 @@ describe("normalizeDayChat", () => {
     // A basic group has no link Telegram documents.
     expect(doc.metadata.sourceUrl).toBeUndefined();
     expect(doc.metadata.appUrl).toBeUndefined();
+  });
+
+  it("keeps Telegram's service account, numeric names and no-reply addresses out of people", () => {
+    const service: TgUser = { ...DAVID, id: 777_000, firstName: "Telegram", lastName: undefined };
+    const numbered: TgUser = {
+      ...DAVID,
+      id: 5550100106,
+      firstName: "+1 202 555 0188",
+      lastName: undefined,
+    };
+    const digits: TgUser = {
+      ...DAVID,
+      id: 5550100107,
+      firstName: "5550100107",
+      lastName: undefined,
+    };
+    const users = new Map(USERS);
+    for (const u of [service, numbered, digits]) users.set(u.id, user(u));
+    const doc = render(
+      GROUP,
+      [
+        stored(GROUP, { id: 1, date: T0, text: "Login code: 12345", senderId: service.id }),
+        stored(GROUP, { id: 2, date: T0 + 30, text: "Hello", senderId: numbered.id }),
+        stored(GROUP, {
+          id: 3,
+          date: T0 + 60,
+          text: "Write to no-reply@example.com or alerts.noreply@example.org",
+          senderId: digits.id,
+        }),
+      ],
+      { users },
+    );
+    const people = doc.metadata.people ?? [];
+    const lids = people.flatMap((p) => p.identifiers.map((i) => i.value));
+    expect(lids).not.toContain("telegram-user:777000");
+    // A person is still identified by account; only the number is not a name.
+    const unnamed = people.filter((p) => p.role === "participant" && p.name === undefined);
+    expect(unnamed.map((p) => p.identifiers[0]!.value)).toEqual([
+      `telegram-user:${numbered.id}`,
+      `telegram-user:${digits.id}`,
+    ]);
+    expect(people.some((p) => p.identifiers.some((i) => i.kind === "email"))).toBe(false);
+    expect(doc.metadata.extra?.participants).toEqual(["You"]);
+  });
+
+  it.each([
+    ["private", JAMIE_CHAT, false],
+    ["saved", chatOf(SELF.id, "saved", "Saved Messages"), false],
+    ["group", GROUP, true],
+    ["supergroup", chatOf(-1003000000003, "supergroup", "Studio Northstar crew"), true],
+    ["forum", chatOf(-1003000000004, "forum", "Riverside Estate paddlers"), true],
+    ["channel", chatOf(-1003000000005, "channel", "Weekly pace updates"), false],
+  ] as const)("describes a %s day with its kind, group flag and tags", (kind, chat, isGroup) => {
+    const doc = render(chat, [
+      stored(chat, { id: 1, date: T0, text: "Q4 budget review", senderId: JAMIE.id }),
+    ]);
+    expect(doc.metadata.extra).toMatchObject({ chatKind: kind, isGroup });
+    expect(doc.metadata.tags).toEqual(isGroup ? ["group"] : []);
+    expect(doc.metadata.documentType).toBe("conversation");
+  });
+
+  it("dates a day by its latest message, edit or later change, whichever is newest", () => {
+    const messages = [
+      stored(JAMIE_CHAT, { id: 1, date: T0, text: "One", senderId: JAMIE.id }),
+      { ...stored(JAMIE_CHAT, { id: 2, date: T0 + 60, text: "Two" }), changedAt: T0 + 900 },
+    ];
+    expect(render(JAMIE_CHAT, messages).sourceUpdatedAt).toBe(
+      new Date((T0 + 900) * 1000).toISOString(),
+    );
+    expect(render(JAMIE_CHAT, messages, { changedAt: T0 + 5000 }).sourceUpdatedAt).toBe(
+      new Date((T0 + 5000) * 1000).toISOString(),
+    );
   });
 
   it("quotes the message replied to, and marks forwards and edits", () => {
@@ -302,7 +378,7 @@ describe("extractMessage", () => {
 });
 
 describe("telegramLinks", () => {
-  it("links supergroups, forums and channels to the message, public or private", () => {
+  it("links supergroups, forums and channels to the message by id, public or private", () => {
     const group = chatOf(-1001234567890, "supergroup", "x");
     expect(bareChannelId(group.id)).toBe(1234567890);
     expect(telegramLinks(asStored(group), { msgId: 42 })).toEqual({
@@ -312,9 +388,10 @@ describe("telegramLinks", () => {
     expect(telegramLinks(asStored(forum), { msgId: 42, topicId: 7 }).sourceUrl).toBe(
       "https://t.me/c/1234567890/7/42",
     );
-    const channel = chatOf(-1009, "channel", "x", { username: "riverside_news_example" });
+    // A username can be given up and claimed by another chat; the id cannot.
+    const channel = chatOf(-1001234567891, "channel", "x", { username: "riverside_news_example" });
     expect(telegramLinks(asStored(channel), { msgId: 3 }).sourceUrl).toBe(
-      "https://t.me/riverside_news_example/3",
+      "https://t.me/c/1234567891/3",
     );
   });
 
