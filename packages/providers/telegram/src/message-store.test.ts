@@ -12,6 +12,7 @@ import {
   markStorageEncryptionRequired,
 } from "@omnesis/core";
 import { TelegramArchive, inspectTelegramStores } from "./message-store.js";
+import { RENDER_REVISION } from "./normalizer.js";
 import { readTelegramStoreKey, StoreKeyUnavailableError } from "./protected-store.js";
 import { TelegramProvider } from "./provider.js";
 import { writeSessionRecord } from "./session-store.js";
@@ -223,6 +224,22 @@ describe("TelegramArchive writes and drain", () => {
     archive.drain({ committedSeq: first.emitSeq, limit: 100 });
     return first.days;
   }
+
+  it("publishes every day again once when an older build rendered them", () => {
+    live(chat, stored(chat, 1, T0, "Q4 budget review at ten"));
+    drainAll();
+    expect(archive.dirtyDayCount()).toBe(0);
+    // An archive whose days a build before local clock times rendered.
+    archive.setMeta("render_revision", "1");
+    archive.close();
+    archive = TelegramArchive.open(dir, null, { now: () => clock });
+    expect(archive.getMeta("render_revision")).toBe(String(RENDER_REVISION));
+    expect(drainAll()).toHaveLength(1);
+    // The current build's own archive is left alone on the next open.
+    archive.close();
+    archive = TelegramArchive.open(dir, null, { now: () => clock });
+    expect(archive.dirtyDayCount()).toBe(0);
+  });
 
   it("never issues one emitSeq twice across two handles on the archive", () => {
     live(chat, stored(chat, 1, T0, "Q4 budget review at ten"));

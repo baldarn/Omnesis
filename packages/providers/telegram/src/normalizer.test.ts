@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Adrien Conrath
 
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { ProviderId, SourceId } from "@omnesis/types";
 import { extractMessage } from "./message-extractor.js";
 import { mediaPlaceholder, normalizeDayChat, type DayRenderInput } from "./normalizer.js";
@@ -84,7 +84,11 @@ const JAMIE_CHAT = privateChatWith(JAMIE);
 const GROUP = chatOf(-4005000005, "group", "Studio Northstar crew");
 
 describe("normalizeDayChat", () => {
-  it("renders one day of a private chat with ids, title, UTC times and dates", () => {
+  // Clock times are the host's local time; pin the host's zone.
+  beforeAll(() => vi.stubEnv("TZ", "UTC"));
+  afterAll(() => vi.unstubAllEnvs());
+
+  it("renders one day of a private chat with ids, title, local times and dates", () => {
     const doc = render(JAMIE_CHAT, [
       stored(JAMIE_CHAT, {
         id: 1,
@@ -216,27 +220,40 @@ describe("normalizeDayChat", () => {
     const doc = render(
       GROUP,
       [
-        stored(GROUP, { id: 1, date: T0, text: "Login code: 12345", senderId: service.id }),
-        stored(GROUP, { id: 2, date: T0 + 30, text: "Hello", senderId: numbered.id }),
+        stored(GROUP, {
+          id: 1,
+          date: T0,
+          text: "Login code: 12345",
+          senderId: service.id,
+          outgoing: false,
+        }),
+        stored(GROUP, {
+          id: 2,
+          date: T0 + 30,
+          text: "Hello",
+          senderId: numbered.id,
+          outgoing: false,
+        }),
         stored(GROUP, {
           id: 3,
           date: T0 + 60,
           text: "Write to no-reply@example.com or alerts.noreply@example.org",
           senderId: digits.id,
+          outgoing: false,
         }),
       ],
       { users },
     );
     const people = doc.metadata.people ?? [];
-    const lids = people.flatMap((p) => p.identifiers.map((i) => i.value));
+    const lids = people.flatMap((p) => (p.identifiers ?? []).map((i) => i.value));
     expect(lids).not.toContain("telegram-user:777000");
     // A person is still identified by account; only the number is not a name.
     const unnamed = people.filter((p) => p.role === "participant" && p.name === undefined);
-    expect(unnamed.map((p) => p.identifiers[0]!.value)).toEqual([
+    expect(unnamed.map((p) => p.identifiers?.[0]?.value)).toEqual([
       `telegram-user:${numbered.id}`,
       `telegram-user:${digits.id}`,
     ]);
-    expect(people.some((p) => p.identifiers.some((i) => i.kind === "email"))).toBe(false);
+    expect(people.some((p) => (p.identifiers ?? []).some((i) => i.kind === "email"))).toBe(false);
     expect(doc.metadata.extra?.participants).toEqual(["You"]);
   });
 
@@ -249,7 +266,13 @@ describe("normalizeDayChat", () => {
     ["channel", chatOf(-1003000000005, "channel", "Weekly pace updates"), false],
   ] as const)("describes a %s day with its kind, group flag and tags", (kind, chat, isGroup) => {
     const doc = render(chat, [
-      stored(chat, { id: 1, date: T0, text: "Q4 budget review", senderId: JAMIE.id }),
+      stored(chat, {
+        id: 1,
+        date: T0,
+        text: "Q4 budget review",
+        senderId: JAMIE.id,
+        outgoing: false,
+      }),
     ]);
     expect(doc.metadata.extra).toMatchObject({ chatKind: kind, isGroup });
     expect(doc.metadata.tags).toEqual(isGroup ? ["group"] : []);
@@ -258,8 +281,11 @@ describe("normalizeDayChat", () => {
 
   it("dates a day by its latest message, edit or later change, whichever is newest", () => {
     const messages = [
-      stored(JAMIE_CHAT, { id: 1, date: T0, text: "One", senderId: JAMIE.id }),
-      { ...stored(JAMIE_CHAT, { id: 2, date: T0 + 60, text: "Two" }), changedAt: T0 + 900 },
+      stored(JAMIE_CHAT, { id: 1, date: T0, text: "One", senderId: JAMIE.id, outgoing: false }),
+      {
+        ...stored(JAMIE_CHAT, { id: 2, date: T0 + 60, text: "Two", outgoing: true }),
+        changedAt: T0 + 900,
+      },
     ];
     expect(render(JAMIE_CHAT, messages).sourceUpdatedAt).toBe(
       new Date((T0 + 900) * 1000).toISOString(),
@@ -360,6 +386,26 @@ describe("normalizeDayChat", () => {
     ]);
     expect(doc.content).toContain("**23:59** Jamie Lopez: Night");
     expect(doc.sourceCreatedAt.slice(0, 10)).toBe("2026-03-10");
+  });
+
+  it("writes clock times in the host's zone while the day stays the UTC day", () => {
+    vi.stubEnv("TZ", "Europe/Rome");
+    try {
+      const late = Date.parse("2026-03-10T23:30:00.000Z") / 1000;
+      const doc = render(JAMIE_CHAT, [
+        stored(JAMIE_CHAT, {
+          id: 9,
+          date: late,
+          text: "Night",
+          senderId: JAMIE.id,
+          outgoing: false,
+        }),
+      ]);
+      expect(doc.content).toContain("**00:30** Jamie Lopez: Night");
+      expect(doc.sourceCreatedAt.slice(0, 10)).toBe("2026-03-10");
+    } finally {
+      vi.stubEnv("TZ", "UTC");
+    }
   });
 });
 

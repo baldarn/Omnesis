@@ -8,7 +8,7 @@
  * re-renders anything.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { TelegramError } from "./client/types.js";
 import {
   DAVID,
@@ -68,6 +68,10 @@ const topicListings = (r: SyncRig): number =>
   r.sim.calls.filter((c) => c.method === "iterForumTopics").length;
 
 describe("forum topics", () => {
+  // Clock times are the host's local time; pin the host's zone.
+  beforeAll(() => vi.stubEnv("TZ", "UTC"));
+  afterAll(() => vi.unstubAllEnvs());
+
   it("lists the topics before the walk and renders every message with its topic", async () => {
     const r = await forumRig();
     const { pages } = await syncAll(r.source, null);

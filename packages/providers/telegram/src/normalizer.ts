@@ -10,8 +10,9 @@
  * from what one sync page happened to fetch, so a day re-rendered after an
  * edit, a deletion or a late page is always the whole day.
  *
- * Times are UTC, like the day boundary, so a document reads the same on every
- * host. The account holder is "You". Bots and deleted accounts are not people.
+ * The day boundary is UTC, so a document's external id is the same on every
+ * host; clock times are the collector host's local time, as WhatsApp writes
+ * them. The account holder is "You". Bots and deleted accounts are not people.
  */
 
 import {
@@ -98,8 +99,19 @@ export function dayExternalId(chatId: number, date: string): string {
   return `${chatId}:${date}`;
 }
 
+/**
+ * Bumped when a day's rendering changes for the same archive rows, so an
+ * archive opened by a newer build re-renders the days an older one published.
+ * 2: clock times in the host's local time instead of UTC.
+ */
+export const RENDER_REVISION = 2;
+
+/**
+ * `HH:MM` in the collector host's local time, as WhatsApp's day documents
+ * write it. See #406 — planned: write clock times with a zone.
+ */
 function formatTime(ts: number): string {
-  return new Date(ts * 1000).toISOString().slice(11, 16);
+  return new Date(ts * 1000).toTimeString().slice(0, 5);
 }
 
 function formatDuration(seconds: number | undefined): string | undefined {

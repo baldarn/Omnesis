@@ -31,6 +31,7 @@ import { join } from "node:path";
 import { TRANSCRIBER_UNAVAILABLE, createLogger, normalizePhone } from "@omnesis/core";
 import { openProtectedDatabase, inspectProtectedStore, type Db } from "./protected-store.js";
 import { EXTRACT_REVISION } from "./message-extractor.js";
+import { RENDER_REVISION } from "./normalizer.js";
 import { PENDING_DELETION_TTL_DAYS } from "./limits.js";
 import {
   backoffStep,
@@ -346,6 +347,9 @@ export class TelegramArchive {
     if (priorVersion < 3) this.enrollArchivedMedia();
     db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('store_id', ?)").run(randomUUID());
     this.setMeta("schema_version", String(SCHEMA_VERSION));
+    // Days an older build rendered differently are published again once.
+    if (Number(this.getMeta("render_revision") ?? 1) < RENDER_REVISION) this.markAllDirty();
+    this.setMeta("render_revision", String(RENDER_REVISION));
     this.storeId = this.getMeta("store_id")!;
   }
 

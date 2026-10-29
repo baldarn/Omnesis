@@ -82,6 +82,15 @@ async function waitFor<T>(
 }
 
 describe("Telegram wraps-real: day documents, live edits and deletions, self identity", () => {
+  // Day documents write clock times in the collector host's zone; pin it so the
+  // asserted times do not depend on where the suite runs.
+  const priorTz = process.env.TZ;
+  process.env.TZ = "UTC";
+  afterAll(() => {
+    if (priorTz === undefined) delete process.env.TZ;
+    else process.env.TZ = priorTz;
+  });
+
   let harness: SyntheticE2EHarness;
   let db: InstanceType<typeof Database>;
 
