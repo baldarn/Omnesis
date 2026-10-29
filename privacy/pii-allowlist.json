@@ -39,7 +39,8 @@
       "paths": [
         "packages/providers/whatsapp/src/document-event-profile.test.ts",
         "packages/providers/whatsapp/src/import/chatstorage-parser.test.ts",
-        "packages/providers/whatsapp/src/import/decrypt-parse.test.ts"
+        "packages/providers/whatsapp/src/import/decrypt-parse.test.ts",
+        "packages/providers/whatsapp/src/import/msgstore-parser.test.ts"
       ],
       "reason": "reviewed existing fixture"
     },
@@ -134,7 +135,8 @@
         "packages/providers/whatsapp/src/document-event-profile.test.ts",
         "packages/providers/whatsapp/src/import/chatstorage-parser.test.ts",
         "packages/providers/whatsapp/src/import/decrypt-parse.test.ts",
-        "packages/providers/whatsapp/src/import/importer.test.ts"
+        "packages/providers/whatsapp/src/import/importer.test.ts",
+        "packages/providers/whatsapp/src/import/msgstore-parser.test.ts"
       ],
       "reason": "reviewed existing fixture"
     },
@@ -160,9 +162,11 @@
         "evals/universes/whatsapp-interrupted/sources/whatsapp-messages/fake-corpus.json",
         "packages/collector/src/e2e/whatsapp-interrupted.e2e.test.ts",
         "packages/providers/whatsapp/src/document-event-profile.test.ts",
+        "packages/providers/whatsapp/src/import/android-backup-decrypt.test.ts",
         "packages/providers/whatsapp/src/import/chatstorage-parser.test.ts",
         "packages/providers/whatsapp/src/import/decrypt-parse.test.ts",
-        "packages/providers/whatsapp/src/import/importer.test.ts"
+        "packages/providers/whatsapp/src/import/importer.test.ts",
+        "packages/providers/whatsapp/src/import/msgstore-parser.test.ts"
       ],
       "reason": "reviewed existing fixture"
     },
@@ -171,7 +175,8 @@
       "paths": [
         "packages/providers/whatsapp/src/document-event-profile.test.ts",
         "packages/providers/whatsapp/src/import/chatstorage-parser.test.ts",
-        "packages/providers/whatsapp/src/import/decrypt-parse.test.ts"
+        "packages/providers/whatsapp/src/import/decrypt-parse.test.ts",
+        "packages/providers/whatsapp/src/import/msgstore-parser.test.ts"
       ],
       "reason": "reviewed existing fixture"
     },
