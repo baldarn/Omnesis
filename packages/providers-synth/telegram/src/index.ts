@@ -7,10 +7,11 @@
  * Spreads the REAL definition, built by `buildTelegramProvider` over the
  * simulated server's adapter factory, so a synthetic gateway runs the
  * production provider, archive, walk and normalizer end to end. Only the
- * sign-in is replaced: discovery reports the universe's self account, the QR
- * step is the shared fake, and the context seeds the app credential and a
- * session the simulated server accepts before the real context opens. The
- * state declaration is not inherited; the real source decodes its cursor itself.
+ * sign-in is replaced: discovery reports the universe's self account once it
+ * is paired or its seeded session is on this host, the QR step is the shared
+ * fake, and the context seeds the app credential and a session the simulated
+ * server accepts before the real context opens. The state declaration is not
+ * inherited; the real source decodes its cursor itself.
  *
  * A universe without `sources/telegram-messages/fake-corpus.json` has no
  * Telegram account at all; there is no fixture-replay mode.
@@ -51,12 +52,17 @@ export default defineProvider<TelegramProvider>({
   ...rest,
   // The real one asks for the operator's api_id/api_hash; the twin seeds its own.
   credentials: undefined,
-  discover: () =>
-    Promise.resolve(
-      universeHasTelegramCorpus()
-        ? preDiscoveredAccounts(TELEGRAM_PROVIDER_ID, [selfAccount()])
-        : [],
-    ),
+  // Paired once the shared sign-in has run, or once a context has seeded this
+  // host's session: the real discovery then finds it on disk, so a collector
+  // restarted over a source the gateway already holds still hosts it.
+  async discover(ctx) {
+    if (!universeHasTelegramCorpus()) return [];
+    const self = selfAccount();
+    const stored = ctx?.configDir ? await rest.discover!(ctx) : [];
+    return stored.some((account) => (typeof account === "string" ? account : account.id) === self)
+      ? [self]
+      : preDiscoveredAccounts(TELEGRAM_PROVIDER_ID, [self]);
+  },
   authenticate: (session) =>
     fakeQrSession(TELEGRAM_PROVIDER_ID, selfAccount(), session, {
       title: "Scan this code with Telegram",
