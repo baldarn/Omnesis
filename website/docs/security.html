@@ -713,6 +713,20 @@ Certificate  expiring
           connected since a renewal, with the command that brings it back.
         </p>
 
+        <h3 id="public-roots">Public root certificates</h3>
+        <p>
+          The gateway, collector and CLI verify public names with the root certificates Node.js
+          bundles. Node.js checks no certificate revocation and reads no browser blocklist, so a
+          root that Mozilla removes stays trusted until Node.js ships a newer set. Omnesis does not
+          trust roots that Mozilla has removed but the installed Node.js still bundles; this needs
+          Node.js 24.5 or later. The npm runs and Node.js header downloads that the installer, the
+          <code>omnesis</code> launcher, <code>omnesis update</code> and the hardened gateway's
+          release build start do not trust them either, unless npm is configured with its own
+          <code>ca</code> or <code>cafile</code>. Keep Node.js current all the same. Tools outside
+          Omnesis, such as <code>curl</code> and <code>git</code>, use the operating system's store,
+          so keep the operating system's CA certificates current too.
+        </p>
+
         <nav class="docs-pager" aria-label="Pages">
           <a href="/docs/operating"
             ><span class="pager-label">Previous</span><span class="pager-title">Operating</span></a

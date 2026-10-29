@@ -70,6 +70,16 @@ test("website/hardened-gateway.sh mirrors scripts/hardened-gateway.sh exactly", 
   expect(mirror).toBe(readFileSync(script, "utf8"));
 });
 
+test("the release build runs npm ci with the root-certificate preload it writes beside build.sh", () => {
+  // The preload's body is held to core's by packages/core/src/tls-distrust.test.ts.
+  const text = readFileSync(script, "utf8");
+  expect(text).toContain(`cat > "$BUILD_DIR/distrust-roots.mjs" <<'EOF'`);
+  expect(text).toMatch(
+    /^NODE_OPTIONS="--import=file:\/\/\$BUILD_VIEW\/distrust-roots\.mjs" npm ci /m,
+  );
+  expect(text).not.toMatch(/^npm ci /m);
+});
+
 test("both scripts are executable in the tree", () => {
   for (const file of ["hardened-gateway.sh", "hardened-gateway-exec.sh"]) {
     expect(lstatSync(join(repoRoot, "scripts", file)).mode & 0o111).not.toBe(0);

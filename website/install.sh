@@ -550,6 +550,7 @@ UPDATE_LOCK_HELPER_TMP=""
 INSTALL_UPDATE_LOCK_ID=""
 INSTALL_UPDATE_HEARTBEAT_PID=""
 SOURCE_CHECKOUT_TMP=""
+NPM_TRUST_DIR=""
 
 cleanup_temp_files() {
   if [ -n "${NODESOURCE_TMP_DIR:-}" ] && [ -d "$NODESOURCE_TMP_DIR" ]; then
@@ -577,6 +578,11 @@ cleanup_temp_files() {
   if [ -n "${SOURCE_CHECKOUT_TMP:-}" ] && [ -d "$SOURCE_CHECKOUT_TMP" ]; then
     rm -rf "$SOURCE_CHECKOUT_TMP"
   fi
+  if [ -n "${NPM_TRUST_DIR:-}" ] && [ -d "$NPM_TRUST_DIR" ]; then
+    rm -rf "$NPM_TRUST_DIR"
+  fi
+  # run_nodesource_setup cleans up mid-run; the next npm makes a fresh one.
+  NPM_TRUST_DIR=""
   if [ -n "${INSTALL_UPDATE_HEARTBEAT_PID:-}" ]; then
     kill "$INSTALL_UPDATE_HEARTBEAT_PID" >/dev/null 2>&1 || true
     wait "$INSTALL_UPDATE_HEARTBEAT_PID" 2>/dev/null || true
@@ -781,6 +787,8 @@ ensure_node() {
   fi
   if node_install_compatible; then
     info "Node $(node --version) found"
+    # In this shell, so cleanup_temp_files removes it; see with_npm_trust.
+    : "${NPM_TRUST_DIR:=$(mktemp -d)}"
     return
   fi
 
@@ -824,6 +832,8 @@ ensure_node() {
 
   node_install_compatible || fail "Node install did not produce Node $NODE_INSTALL_RANGE on PATH. Select a supported Node binary and re-run."
   info "Node $(node --version) ready"
+  # After run_nodesource_setup, whose cleanup would remove it.
+  : "${NPM_TRUST_DIR:=$(mktemp -d)}"
 }
 
 verify_secure_nodesource_path() {
@@ -940,7 +950,7 @@ source_step_failed() {
 # its own `npm ci` (packages/cli/src/update/node-gyp-headers.ts); a test keeps
 # the copies identical.
 prepare_node_gyp_headers() {
-  ( cd "$1" && node -e 'const fs = require("fs"), os = require("os"), path = require("path");
+  ( cd "$1" && with_npm_trust node -e 'const fs = require("fs"), os = require("os"), path = require("path");
 const option = (name) => ["npm_package_config_node_gyp_", "npm_config_"].map((prefix) =>
   Object.entries(process.env).find(([key]) => key.toLowerCase() === prefix + name)?.[1]).find(Boolean) || "";
 if (option("nodedir")) process.exit(0);
@@ -979,6 +989,50 @@ require_source_build_memory() {
   fail "Building Omnesis from source needs about 3.5 GB of memory, and this machine can use ${SOURCE_BUILD_MEMORY_MB} MB. Install on a machine with more memory, or, if this one has swap to spare, re-run with OMNESIS_BUILD_MEMORY_MB=4096 to build anyway."
 }
 
+
+# npm reaches the registry with Node's bundled CA store and checks no
+# revocation, so a root Mozilla has removed from NSS stays trusted by npm until
+# Node ships a newer store. Every npm the installer runs, the node-gyp header
+# fetch, and the npm ci of the source launcher it writes preload a filter that
+# drops those roots. It is PRELOAD_SOURCE in packages/core/src/tls-distrust.ts,
+# which a test holds this copy to. It filters the default store only, so a ca
+# or cafile the user configured for npm still wins.
+npm_trust_preload() {
+  cat <<'EOF'
+import { createHash } from "node:crypto";
+import tls from "node:tls";
+const distrusted = new Set([
+  "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b",
+  "125609aa301da0a249b97a8239cb6a34216f44dcac9f3954b14292f2e8c8608f",
+  "bc4d809b15189d78db3e1d8cf4f9726a795da1643ca5f1358e1ddb0edc0d7eb3",
+]);
+const keep = (pem) => !distrusted.has(createHash("sha256").update(Buffer.from(pem.replace(/-----(?:BEGIN|END) CERTIFICATE-----|\s/gu, ""), "base64")).digest("hex"));
+if (typeof tls.setDefaultCACertificates === "function") {
+  const current = tls.getCACertificates("default");
+  if (!current.every(keep)) tls.setDefaultCACertificates(current.filter(keep));
+}
+EOF
+}
+
+# Run a command with the preload. ensure_node makes NPM_TRUST_DIR (private,
+# 0700) in the installer's own shell, so cleanup_temp_files removes it; this
+# covers a call before that.
+with_npm_trust() {
+  [ -n "${NPM_TRUST_DIR:-}" ] || NPM_TRUST_DIR="$(mktemp -d)" ||
+    fail "Could not create a private temporary directory for npm's certificate filter."
+  NPM_TRUST_PRELOAD="$NPM_TRUST_DIR/distrust-roots.mjs"
+  [ -f "$NPM_TRUST_PRELOAD" ] || npm_trust_preload >"$NPM_TRUST_PRELOAD"
+  # NODE_OPTIONS splits on spaces, so a TMPDIR holding one goes in encoded.
+  NPM_TRUST_URL="file://$(printf '%s' "$NPM_TRUST_PRELOAD" | sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g')"
+  NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=$NPM_TRUST_URL" "$@"
+}
+
+# `npm run` reaches no registry, so a build keeps exactly the NODE_OPTIONS it
+# was given.
+npm() {
+  [ "${1:-}" != run ] || { command npm "$@"; return; }
+  with_npm_trust command npm "$@"
+}
 
 npm_flags() {
   # shellcheck disable=SC2086
@@ -1707,17 +1761,42 @@ try {
 # Render the stable source front door. Keeping the renderer separate lets a
 # package migration compare an existing launcher byte-for-byte before it
 # replaces anything at the same path.
+# The with_npm_trust the current source launcher carries.
+render_source_npm_trust() {
+  cat <<EOF
+# The installer's npm trust preload; see with_npm_trust in the installer.
+with_npm_trust() {
+  NPM_TRUST_DIR="\$(mktemp -d)" || return 1
+  cat >"\$NPM_TRUST_DIR/distrust-roots.mjs" <<'NPM_TRUST_EOF'
+$(npm_trust_preload)
+NPM_TRUST_EOF
+  NPM_TRUST_URL="file://\$(printf '%s' "\$NPM_TRUST_DIR/distrust-roots.mjs" | sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g')"
+  NODE_OPTIONS="\${NODE_OPTIONS:+\$NODE_OPTIONS }--import=\$NPM_TRUST_URL" "\$@"
+  NPM_TRUST_STATUS=\$?
+  rm -rf "\$NPM_TRUST_DIR"
+  return "\$NPM_TRUST_STATUS"
+}
+EOF
+}
+
 render_source_wrapper() {
   SOURCE_ROOT="$1"
   SOURCE_DEPENDENCY_KIND=f
   SOURCE_DEPENDENCY_PATH=node_modules/tsx/dist/loader.mjs
   SOURCE_CLI_COMMAND='node --import "$SOURCE_LOADER_URL"'
+  # The legacy launcher stays byte-identical to the one v0.6.0 wrote, so only
+  # the current one runs its npm ci with the trust preload; see with_npm_trust.
+  NPM_TRUST_RUN='with_npm_trust '
+  NPM_TRUST_FUNCTION="$(render_source_npm_trust)
+"
   case "${2:-current}" in
     current) ;;
     legacy)
       SOURCE_DEPENDENCY_KIND=x
       SOURCE_DEPENDENCY_PATH=node_modules/.bin/tsx
       SOURCE_CLI_COMMAND='"$SOURCE_ROOT/node_modules/.bin/tsx"'
+      NPM_TRUST_RUN=""
+      NPM_TRUST_FUNCTION=""
       ;;
     *) return 1 ;;
   esac
@@ -1835,10 +1914,10 @@ try {
 update_unfinished() {
   [ "\$UPDATE_PHASE" = "applying" ] || [ "\$UPDATE_PHASE" = "rolling-back" ] || [ "\$UPDATE_PHASE" = "mismatch" ]
 }
-# The node-gyp header check the installer runs before each npm ci; see
+${NPM_TRUST_FUNCTION}# The node-gyp header check the installer runs before each npm ci; see
 # prepare_node_gyp_headers in the installer.
 prepare_node_gyp_headers() {
-  ( cd "\$1" && node -e 'const fs = require("fs"), os = require("os"), path = require("path");
+  ( cd "\$1" && ${NPM_TRUST_RUN}node -e 'const fs = require("fs"), os = require("os"), path = require("path");
 const option = (name) => ["npm_package_config_node_gyp_", "npm_config_"].map((prefix) =>
   Object.entries(process.env).find(([key]) => key.toLowerCase() === prefix + name)?.[1]).find(Boolean) || "";
 if (option("nodedir")) process.exit(0);
@@ -1869,11 +1948,11 @@ if (!whole()) fs.rmSync(dir, { recursive: true, force: true });' "\$(npm config 
 # A failed install is retried once from an empty node_modules.
 install_source_dependencies() {
   prepare_node_gyp_headers "\$SOURCE_ROOT"
-  ( cd "\$SOURCE_ROOT" && npm ci ) && return 0
+  ( cd "\$SOURCE_ROOT" && ${NPM_TRUST_RUN}npm ci ) && return 0
   printf '%s\n' "Installing dependencies failed; installing them again from an empty node_modules..." >&2
   rm -rf "\$SOURCE_ROOT/node_modules" || return 1
   prepare_node_gyp_headers "\$SOURCE_ROOT"
-  ( cd "\$SOURCE_ROOT" && npm ci )
+  ( cd "\$SOURCE_ROOT" && ${NPM_TRUST_RUN}npm ci )
 }
 read_update_phase
 if update_unfinished; then

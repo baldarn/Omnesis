@@ -474,10 +474,28 @@ build_release() {
     cp -a "$OMNESIS_HARDENED_NPM_CACHE_SEED/." "$BUILD_CACHE/npm/"
     build_offline="--prefer-offline"
   fi
+  # npm reaches the registry with Node's bundled CA store, which can still hold
+  # roots Mozilla has removed. This preload drops them in npm's process; it is
+  # PRELOAD_SOURCE in packages/core/src/tls-distrust.ts, which a test holds
+  # this copy to.
+  cat > "$BUILD_DIR/distrust-roots.mjs" <<'EOF'
+import { createHash } from "node:crypto";
+import tls from "node:tls";
+const distrusted = new Set([
+  "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b",
+  "125609aa301da0a249b97a8239cb6a34216f44dcac9f3954b14292f2e8c8608f",
+  "bc4d809b15189d78db3e1d8cf4f9726a795da1643ca5f1358e1ddb0edc0d7eb3",
+]);
+const keep = (pem) => !distrusted.has(createHash("sha256").update(Buffer.from(pem.replace(/-----(?:BEGIN|END) CERTIFICATE-----|\s/gu, ""), "base64")).digest("hex"));
+if (typeof tls.setDefaultCACertificates === "function") {
+  const current = tls.getCACertificates("default");
+  if (!current.every(keep)) tls.setDefaultCACertificates(current.filter(keep));
+}
+EOF
   cat > "$BUILD_DIR/build.sh" <<EOF
 set -eu
 cd "$BUILD_VIEW/src"
-npm ci --no-audit --no-fund $build_offline
+NODE_OPTIONS="--import=file://$BUILD_VIEW/distrust-roots.mjs" npm ci --no-audit --no-fund $build_offline
 heap="\$(node_modules/.bin/tsx --eval 'import("$BUILD_VIEW/src/packages/cli/src/update/build-heap.ts").then((m) => process.stdout.write(m.buildHeapEnv()?.NODE_OPTIONS ?? ""))' 2>/dev/null || true)"
 NODE_OPTIONS="\$heap" npm run build
 EOF
