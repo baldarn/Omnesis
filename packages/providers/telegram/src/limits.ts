@@ -97,3 +97,11 @@ export const MEDIA_DOWNLOAD_STALL_MS = 60_000;
  * due to ask for another page. One transcription or OCR call can take minutes.
  */
 export const MEDIA_CONTINUATION_MARGIN_MS = 15 * 60_000;
+
+/**
+ * How often a sync page confirms the session with Telegram (`updates.getState`)
+ * before doing its work. Revocation stops the update loop without an event, so
+ * an idle source learns of it only through a request; the scheduled sync is
+ * far apart enough that every scheduled run still checks.
+ */
+export const AUTH_CHECK_INTERVAL_MS = 5 * 60_000;

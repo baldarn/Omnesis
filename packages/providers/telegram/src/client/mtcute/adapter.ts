@@ -341,19 +341,42 @@ class MtcuteTelegramAdapter implements TelegramAdapter {
   ): Promise<TgDownloaded> {
     return downloadWithReferenceRefresh(target, opts.maxBytes, {
       download: (fileId) =>
-        this.guard(() =>
-          this.client.downloadAsBuffer(fileId, {
-            abortSignal: opts.signal,
-            // One byte over the limit is enough to know the file is too large.
-            limit: opts.maxBytes + 1,
-            stallTimeout: MEDIA_DOWNLOAD_STALL_MS,
-          }),
-        ),
+        this.guard(() => this.downloadCapped(fileId, opts.maxBytes, opts.signal)),
       refetch: async (chatId, msgId) => {
         const [fresh] = await this.getMessages(chatId, [msgId]);
         return fresh ?? null;
       },
     });
+  }
+
+  /**
+   * The file's bytes, read chunk by chunk and stopped once past `maxBytes`, so
+   * the caller can refuse an oversized file without fetching all of it.
+   * mtcute's `limit` cannot cap a download: it accepts only divisors of 1 MiB
+   * or the exact file size, and anything else throws before a byte is read.
+   */
+  private async downloadCapped(
+    fileId: string,
+    maxBytes: number,
+    signal: AbortSignal | undefined,
+  ): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for await (const chunk of this.client.downloadAsIterable(fileId, {
+      abortSignal: signal,
+      stallTimeout: MEDIA_DOWNLOAD_STALL_MS,
+    })) {
+      chunks.push(chunk);
+      total += chunk.byteLength;
+      if (total > maxBytes) break;
+    }
+    const data = new Uint8Array(total);
+    let at = 0;
+    for (const chunk of chunks) {
+      data.set(chunk, at);
+      at += chunk.byteLength;
+    }
+    return data;
   }
 
   async *iterForumTopics(

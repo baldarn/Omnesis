@@ -258,7 +258,7 @@ export class TelegramMessagesSource {
     cursor: TelegramSyncCursor | null,
     opts?: SyncOptions,
   ): Promise<SyncResult<TelegramSyncCursor>> {
-    await this.provider.ensureUsable(opts?.signal);
+    await this.provider.ensureUsable(opts?.signal, (opts?.run?.page ?? 0) > 0);
     const archive = this.provider.getArchive();
     const prior = cursor ? telegramStateSpec.decode(cursor) : null;
     const committedSeq = prior?.storeId === archive.storeId ? prior.committedSeq : 0;

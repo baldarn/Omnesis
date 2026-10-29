@@ -354,7 +354,10 @@ describe("MtcuteTelegramAdapter.downloadMedia", () => {
 
   /** A real adapter whose client never touches the network: its calls are stubbed. */
   function stubbedAdapter(stubs: {
-    downloadAsBuffer: (location: unknown, params: { limit?: number }) => Promise<Uint8Array>;
+    downloadAsIterable: (
+      location: unknown,
+      params: { limit?: number },
+    ) => AsyncIterable<Uint8Array>;
     getMessages: () => Promise<(Message | null)[]>;
   }) {
     const dir = mkdtempSync(join(tmpdir(), "omnesis-telegram-adapter-"));
@@ -364,12 +367,12 @@ describe("MtcuteTelegramAdapter.downloadMedia", () => {
       { deviceModel: "Test", systemVersion: "1", appVersion: "1", langCode: "en" },
     );
     const client = (adapter as unknown as { client: Record<string, unknown> }).client;
-    client.downloadAsBuffer = vi.fn(stubs.downloadAsBuffer);
+    client.downloadAsIterable = vi.fn(stubs.downloadAsIterable);
     client.getMessages = vi.fn(stubs.getMessages);
     return {
       adapter,
       client: client as unknown as {
-        downloadAsBuffer: ReturnType<typeof vi.fn>;
+        downloadAsIterable: ReturnType<typeof vi.fn>;
         getMessages: ReturnType<typeof vi.fn>;
       },
       dir,
@@ -378,15 +381,47 @@ describe("MtcuteTelegramAdapter.downloadMedia", () => {
 
   const BYTES = new TextEncoder().encode("Q4 budget review notes");
 
+  async function* streaming(...chunks: Uint8Array[]): AsyncIterable<Uint8Array> {
+    for (const chunk of chunks) yield chunk;
+  }
+
+  // eslint-disable-next-line require-yield
+  async function* failing(err: unknown): AsyncIterable<Uint8Array> {
+    throw err;
+  }
+
+  it("stops reading a file once it passes the size cap, and refuses it", async () => {
+    const chunk = new Uint8Array(4096);
+    let read = 0;
+    const { adapter, dir } = stubbedAdapter({
+      downloadAsIterable: async function* () {
+        for (let i = 0; i < 100; i++) {
+          read += 1;
+          yield chunk;
+        }
+      },
+      getMessages: () => Promise.resolve([null]),
+    });
+    try {
+      await expect(
+        adapter.downloadMedia({ chatId: JAMIE_ID, msgId: 7, fileId: "x" }, { maxBytes: 10_000 }),
+      ).rejects.toMatchObject({ code: "forbidden" });
+      expect(read).toBe(3);
+    } finally {
+      await adapter.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("refreshes a stale file reference from the message and returns the fresh descriptor", async () => {
     const stale = toTgMessage(documentMessage(1)).media!;
     const fresh = toTgMessage(documentMessage(2)).media!;
     expect(fresh.fileId).not.toBe(stale.fileId);
     const { adapter, client, dir } = stubbedAdapter({
-      downloadAsBuffer: (location) =>
+      downloadAsIterable: (location) =>
         location === stale.fileId
-          ? Promise.reject(new tl.RpcError(400, "FILE_REFERENCE_EXPIRED"))
-          : Promise.resolve(BYTES),
+          ? failing(new tl.RpcError(400, "FILE_REFERENCE_EXPIRED"))
+          : streaming(BYTES),
       getMessages: () => Promise.resolve([documentMessage(2)]),
     });
     try {
@@ -394,15 +429,15 @@ describe("MtcuteTelegramAdapter.downloadMedia", () => {
         { chatId: JAMIE_ID, msgId: 7, fileId: stale.fileId!, size: 22 },
         { maxBytes: 1000 },
       );
-      expect(result.data).toBe(BYTES);
+      expect(result.data).toEqual(BYTES);
       expect(result.refreshed).toMatchObject({
         kind: "document",
         fileId: fresh.fileId,
         fileName: "budget.txt",
       });
       expect(client.getMessages).toHaveBeenCalledWith(JAMIE_ID, [7]);
-      // One byte past the limit is enough to tell an oversized file.
-      expect(client.downloadAsBuffer.mock.calls[0]![1]).toMatchObject({ limit: 1001 });
+      // mtcute refuses a `limit` that does not divide 1 MiB, so none is sent.
+      expect(client.downloadAsIterable.mock.calls[0]![1]).not.toHaveProperty("limit");
     } finally {
       await adapter.close();
       rmSync(dir, { recursive: true, force: true });
@@ -412,7 +447,7 @@ describe("MtcuteTelegramAdapter.downloadMedia", () => {
   it("classifies a download flood wait and a vanished message", async () => {
     const flood = Object.assign(new tl.RpcError(420, "FLOOD_WAIT_%d"), { seconds: 45 });
     const { adapter, dir } = stubbedAdapter({
-      downloadAsBuffer: () => Promise.reject(flood),
+      downloadAsIterable: () => failing(flood),
       getMessages: () => Promise.resolve([null]),
     });
     try {
@@ -424,7 +459,7 @@ describe("MtcuteTelegramAdapter.downloadMedia", () => {
       rmSync(dir, { recursive: true, force: true });
     }
     const gone = stubbedAdapter({
-      downloadAsBuffer: () => Promise.reject(new tl.RpcError(400, "FILE_REFERENCE_EXPIRED")),
+      downloadAsIterable: () => failing(new tl.RpcError(400, "FILE_REFERENCE_EXPIRED")),
       getMessages: () => Promise.resolve([null]),
     });
     try {

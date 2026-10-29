@@ -23,7 +23,7 @@ import { createLogger, toErrorMessage } from "@omnesis/core";
 import { SyncError, type SyncRemediation } from "@omnesis/types";
 import { loadAppCredentials } from "./credentials-spec.js";
 import { telegramDeviceInfo } from "./device.js";
-import { CONNECT_TIMEOUT_MS, GAP_SUSPECT_OUTAGE_S } from "./limits.js";
+import { AUTH_CHECK_INTERVAL_MS, CONNECT_TIMEOUT_MS, GAP_SUSPECT_OUTAGE_S } from "./limits.js";
 import { extractMessage } from "./message-extractor.js";
 import { isChatIncluded, type ChatPolicy, type TakeoutHolder } from "./history-walker.js";
 import { TelegramArchive, type StoredUser } from "./message-store.js";
@@ -97,6 +97,8 @@ export class TelegramProvider {
   private readonly configDir: string;
   private readonly now: () => Date;
   private connecting: Promise<ConnectOutcome> | undefined;
+  /** When `ensureUsable` last confirmed the authorization with Telegram. */
+  private lastAuthCheckAt: number | undefined;
   private self: TgUser | undefined;
   private revokedReason: RevocationReason | undefined;
   private revocationWrite: Promise<void> = Promise.resolve();
@@ -246,8 +248,12 @@ export class TelegramProvider {
    * Called at the top of every sync page: fail as auth when the session is
    * gone, as network when the client cannot connect, and otherwise confirm the
    * authorization with one request so a revocation is noticed while idle.
+   * The confirmation runs on the first page of a run and then at most once per
+   * `AUTH_CHECK_INTERVAL_MS`: a run of media pages would otherwise send one
+   * request per page, and any other request a page makes reports a revocation
+   * on its own.
    */
-  async ensureUsable(signal?: AbortSignal): Promise<void> {
+  async ensureUsable(signal?: AbortSignal, continuation = false): Promise<void> {
     if (this.revokedReason) return this.failRevoked();
     if (this.suspended) throw new SyncError("network", "The Telegram connection is paused.");
     let outcome = await withTimeout(
@@ -267,11 +273,19 @@ export class TelegramProvider {
       throw new SyncError("network", "Telegram did not connect in time.", { retryAfterMs: 60_000 });
     }
     if (!outcome.ok) throw this.syncErrorFrom(outcome.error);
-    try {
-      await this.adapter.checkAuthorization({ signal });
-    } catch (err) {
-      if (this.revokedReason) return this.failRevoked();
-      throw this.syncErrorFrom(err);
+    const checkedAt = this.now().getTime();
+    if (
+      !continuation ||
+      this.lastAuthCheckAt === undefined ||
+      checkedAt - this.lastAuthCheckAt >= AUTH_CHECK_INTERVAL_MS
+    ) {
+      try {
+        await this.adapter.checkAuthorization({ signal });
+      } catch (err) {
+        if (this.revokedReason) return this.failRevoked();
+        throw this.syncErrorFrom(err);
+      }
+      this.lastAuthCheckAt = checkedAt;
     }
     if (this.revokedReason) return this.failRevoked();
     this.archive.setMeta("last_online_at", String(this.nowSeconds()));

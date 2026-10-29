@@ -313,6 +313,24 @@ describe("TelegramMessagesSource.sync", () => {
     expect(r.sim.calls.some((c) => c.method === "iterDialogs")).toBe(false);
   });
 
+  it("confirms the session on a run's first page, not on every continuation page", async () => {
+    const r = await twoChatRig();
+    const boot = await syncAll(r.source, null);
+    const run = (page: number) =>
+      ({ run: { id: "run-media", reason: "scheduled", start: "warm", page } }) as never;
+    const checks = () => r.sim.calls.filter((c) => c.method === "checkAuthorization").length;
+    const before = checks();
+    await r.source.sync(boot.cursor, run(0));
+    await r.source.sync(boot.cursor, run(1));
+    await r.source.sync(boot.cursor, run(2));
+    expect(checks() - before).toBe(1);
+    // A new run confirms it again, so a session ended while idle is noticed.
+    r.sim.revoke("SESSION_REVOKED");
+    await expect(r.source.sync(boot.cursor, run(0))).rejects.toSatisfy(
+      (err: unknown) => err instanceof SyncError && err.kind === "auth",
+    );
+  });
+
   it("fails as auth once Telegram ends the session", async () => {
     const r = await twoChatRig();
     const boot = await syncAll(r.source, null);
