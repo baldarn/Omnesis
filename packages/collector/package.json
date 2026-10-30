@@ -32,6 +32,7 @@
     "@omnesis/provider-obsidian": "*",
     "@omnesis/provider-openclaw": "*",
     "@omnesis/provider-outlook": "*",
+    "@omnesis/provider-paperless": "*",
     "@omnesis/provider-pi": "*",
     "@omnesis/provider-plaid": "*",
     "@omnesis/provider-screen-time": "*",

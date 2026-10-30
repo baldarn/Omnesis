@@ -638,6 +638,20 @@ describe("experimentalDescriptorHidden", () => {
     expect(experimentalDescriptorHidden(descriptor!, false)).toBe(false);
   });
 
+  it("the registered Paperless-ngx source is hidden without experimental mode and listed with it", async () => {
+    const { allDefinitions } = await import("./source-descriptors.js");
+    const paperless = allDefinitions.find(
+      (def) => def.type === "provider" && def.provider.id === "paperless",
+    );
+    expect(paperless, "the collector registers @omnesis/provider-paperless").toBeDefined();
+    const [descriptor] = extractDescriptors(paperless!);
+    expect(String(descriptor!.id)).toBe("paperless-documents");
+    expect(descriptor!.experimental).toBe(true);
+    expect(experimentalDescriptorHidden(descriptor!, false)).toBe(true);
+    process.env[EXPERIMENTAL_ENV_VAR] = "1";
+    expect(experimentalDescriptorHidden(descriptor!, false)).toBe(false);
+  });
+
   it("does not hide an experimental descriptor when experimental mode is on", () => {
     process.env[EXPERIMENTAL_ENV_VAR] = "1";
     expect(experimentalDescriptorHidden(fakeDescriptor("acme", "acme-source", true), false)).toBe(

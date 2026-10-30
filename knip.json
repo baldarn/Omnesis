@@ -115,6 +115,7 @@
         "@omnesis/provider-openclaw",
         "@omnesis/provider-outlook",
         "@omnesis/provider-outlook-synth",
+        "@omnesis/provider-paperless",
         "@omnesis/provider-pi",
         "@omnesis/provider-plaid",
         "@omnesis/provider-plaid-synth",

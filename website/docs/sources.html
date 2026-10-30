@@ -944,6 +944,18 @@
                   See <a href="#local-files">Local Files</a>.
                 </td>
               </tr>
+              <tr>
+                <td>
+                  Paperless-ngx<br /><span class="pill">any collector</span>
+                  <span class="pill">API token</span> <span class="pill">Experimental</span>
+                </td>
+                <td>
+                  Archived documents from a self-hosted Paperless-ngx, with their OCR text, notes,
+                  correspondent, document type, tags and custom fields; custom field values are
+                  queryable in SQL. Offered only when the Gateway runs with
+                  <code>OMNESIS_EXPERIMENTAL=1</code> — see <a href="#paperless">Paperless-ngx</a>.
+                </td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -997,6 +1009,77 @@
             only once a scan has read its folder from end to end. A folder that could not be read —
             an unmounted drive, a changed permission — is left alone until it can be, and the other
             folders are unaffected. Remove the source to purge everything at once.
+          </li>
+        </ul>
+
+        <h3 id="paperless">Paperless-ngx</h3>
+        <p>
+          Paperless-ngx is <strong>experimental</strong>: it appears in the source picker only when
+          the Gateway runs with <code>OMNESIS_EXPERIMENTAL=1</code>, and its behavior may change
+          between releases.
+        </p>
+        <p>
+          Paperless-ngx indexes the documents a self-hosted
+          <a href="https://docs.paperless-ngx.com/">Paperless-ngx</a> instance has archived; it
+          needs Paperless-ngx 2.16 or later. It reads the text Paperless-ngx already extracted, so
+          Omnesis neither downloads the original files nor runs OCR on them. Adding the source asks
+          for two things: the address you open Paperless-ngx at, including any path it is served
+          under, and an API token from <strong>My Profile</strong> in Paperless-ngx. The collector
+          must be able to reach that address.
+        </p>
+        <div class="term">
+          <div class="term-bar"><span></span><span></span><span></span></div>
+          <div class="term-body">
+            <p>
+              <span class="t-prompt">❯</span>
+              <span class="t-cmd">omnesis sources add paperless</span>
+            </p>
+          </div>
+        </div>
+        <ul>
+          <li>
+            <strong>What the token sees is what gets indexed.</strong> A Paperless-ngx token carries
+            every permission of its user, including editing and deleting, even though Omnesis only
+            reads. A dedicated Paperless-ngx user with only the View permission on documents, tags,
+            correspondents, document types, custom fields and UI settings is enough; Paperless-ngx
+            names the user to Omnesis through the UI settings. On an instance several people share,
+            documents owned by another user are indexed if the token can see them, but are not
+            attributed to you. Each document becomes one document whose "Open in source" link opens
+            it in the Paperless-ngx web UI.
+          </li>
+          <li>
+            <strong>Tables.</strong> <code>paperless_documents</code> holds one row per document
+            with its correspondent, document type, tags and its own date — the date on the letter,
+            not the scan date. <code>paperless_custom_field_values</code> holds each custom field
+            value with typed columns, so monetary amounts can be summed and due dates compared.
+          </li>
+          <li>
+            <strong>Freshness.</strong> Each sync fetches the documents whose content, tags,
+            correspondent, custom fields or notes changed. A bulk edit of custom fields does not
+            mark the documents changed in Paperless-ngx, so it reaches Omnesis with the daily
+            listing. Renaming or deleting a tag, correspondent, document type or custom field does
+            not change the documents themselves either, so Omnesis re-reads every document once
+            after it; adding one re-reads nothing.
+          </li>
+          <li>
+            <strong>Deletion.</strong> Once a day the source lists every document id. A document
+            that later listings keep leaving out is removed from the index. A document in the
+            Paperless-ngx trash counts as deleted.
+          </li>
+          <li>
+            <strong>Certificates and proxies.</strong> Plain <code>http://</code> addresses on your
+            own network work. For an <code>https://</code> address with a certificate from your own
+            certificate authority, start the collector with
+            <code>NODE_EXTRA_CA_CERTS</code> pointing at that authority's certificate. A reverse
+            proxy that puts a single sign-on page in front of Paperless-ngx must let requests under
+            <code>/api/</code> through with the token.
+          </li>
+          <li>
+            <strong>Several instances.</strong> Each Paperless-ngx user on each instance is its own
+            source; adding a second one leaves the first untouched. Use the same address for an
+            instance everywhere: the same instance added under two addresses is indexed twice.
+            Re-authenticating a source accepts only a token for the same user at the same address;
+            to move a source to a new address, add the new address and remove the old source.
           </li>
         </ul>
 
