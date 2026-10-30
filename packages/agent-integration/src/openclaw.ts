@@ -30,7 +30,11 @@ import {
   type OperationalIntegrationCredentials,
 } from "./credentials.js";
 import { readGatewayCapabilities } from "./gateway-capabilities.js";
-import { DurableIntegrationInbox, type WorkflowBinding } from "./inbox.js";
+import {
+  AnswerCompletionNotStartedError,
+  DurableIntegrationInbox,
+  type WorkflowBinding,
+} from "./inbox.js";
 import {
   DurableTranscriptIngestor,
   type AgentConversationMessage,
@@ -54,7 +58,12 @@ import {
   PinnedGatewayHttpClient,
 } from "./http.js";
 import { formatAnswerCitations } from "./answer-citations.js";
-import { NativeAnswerMcpClient, integrationOAuthFetch } from "./native-answer-mcp.js";
+import {
+  NativeAnswerMcpClient,
+  integrationOAuthFetch,
+  parseNativeAnswerResponse,
+  type NativeAnswerResponse,
+} from "./native-answer-mcp.js";
 import {
   FORWARDED_TOOL_NAMES,
   FORWARDED_TOOL_TIMEOUT_MS,
@@ -157,6 +166,7 @@ interface OpenClawIntegrationApi {
     options: { name: string; optional?: boolean } | { names: string[]; optional?: boolean },
   ): void;
   runtime: {
+    version?: string;
     agent: {
       session: {
         listSessionEntries(input: { agentId: string; readOnly?: boolean }): Iterable<{
@@ -957,6 +967,10 @@ export class OpenClawTranscriptSource {
           channel: identity.channel,
           chatId: identity.chatId,
           role,
+          // Transcript roles describe model input/output, not ownership. The
+          // durable reader supplies no verified per-turn sender identity, and
+          // session routes or names inside the body cannot establish one.
+          author: { kind: role === "assistant" ? "agent" : "unknown" },
           text,
           occurredAt,
         });
@@ -1707,8 +1721,7 @@ class OpenClawIntegrationService {
    */
   async completeAnswerDelivery(delivery: AnswerCompletionDelivery): Promise<void> {
     const routes = this.completionRoutes;
-    const mcp = this.answerMcp;
-    if (!routes || !mcp) throw new Error("integration service is not running");
+    if (!routes) throw new Error("integration service is not running");
     const route = routes.get(delivery.nativeConversationId);
     if (!route || (route.taskId !== "pending" && route.taskId !== delivery.taskId)) {
       throw new Error("no matching OpenClaw conversation route for answer completion");
@@ -1719,11 +1732,32 @@ class OpenClawIntegrationService {
     if (route.taskId === "pending") {
       routes.put({ ...route, taskId: delivery.taskId });
     }
-    // The delivery is an operational wake carrying only task identity. Reading
-    // the released answer still uses this installation's OAuth principal and
-    // therefore resolves through its current grant and revocation state.
-    const response = await mcp.getTask(delivery.taskId);
     if (isSessionRoute(route)) {
+      // A Watch task belongs to its firing, not the installation's OAuth
+      // principal. The current delivery credential can retrieve only this
+      // committed completion; the gateway revalidates its live subscription
+      // authority without reviving the original short-lived firing token.
+      const credentials = this.credentials;
+      if (!credentials) throw new Error("integration service is not running");
+      const http = new PinnedGatewayHttpClient(
+        credentials.gatewayUrl,
+        credentials.deliveryToken,
+        this.requireTrust(),
+      );
+      let response: NativeAnswerResponse;
+      try {
+        response = parseNativeAnswerResponse(
+          await http.requestJson(
+            "GET",
+            `/subscriptions/answer-completions/${encodeURIComponent(delivery.deliveryId)}`,
+          ),
+        );
+        if (response.taskId !== delivery.taskId || response.status === "approval_required") {
+          throw new Error("completion response does not match the terminal Answer task");
+        }
+      } catch (error) {
+        throw new AnswerCompletionNotStartedError(error);
+      }
       // No conversation to reply into — the ask came from a background wake.
       // Keyed on the delivery, and prefixed: the wake's own run is started
       // under the bare delivery id, so an unprefixed key here could dedupe a
@@ -1742,9 +1776,42 @@ class OpenClawIntegrationService {
       const waiting = this.inbox?.resumeDeferredOutcome(delivery.nativeConversationId) ?? null;
       this.watchRunOutcome(resumed.runId, route.to, waiting?.deliveryId ?? null);
     } else {
+      // Ordinary chat answers remain scoped to the current OAuth principal.
+      const mcp = this.answerMcp;
+      if (!mcp) throw new Error("integration OAuth state is not available");
+      let response: NativeAnswerResponse;
+      try {
+        response = await mcp.getTask(delivery.taskId);
+      } catch (error) {
+        throw new AnswerCompletionNotStartedError(error);
+      }
       // The runtime owns both transcript persistence and normal reply delivery.
       // Never guess a session from channel addressing: multiple sessions can
       // share the same recipient, especially with threads and account scopes.
+      // Older runtimes silently ignore assertCurrent, so a preflight-only check
+      // cannot protect the session between validation and native admission.
+      const version = this.api.runtime.version;
+      const parts =
+        typeof version === "string"
+          ? /^(\d{4})\.(\d{1,2})\.(\d{1,2})(?:-\d+)?$/.exec(version)
+          : null;
+      const year = Number(parts?.[1]);
+      const month = Number(parts?.[2]);
+      const day = Number(parts?.[3]);
+      if (
+        !parts ||
+        month < 1 ||
+        month > 12 ||
+        day < 1 ||
+        day > 31 ||
+        year * 10_000 + month * 100 + day < 20_261_005
+      ) {
+        const message =
+          "Update OpenClaw to stable 2026.10.5 or newer and restart its gateway " +
+          "before resuming held chat answers; this host cannot guarantee session admission checks.";
+        this.logger.warn(message);
+        throw new Error(message);
+      }
       const sessionKey = route.sessionKey;
       if (!sessionKey) throw new Error("completion route has no originating OpenClaw session");
       const assertCurrent = () => {

@@ -12,8 +12,8 @@ import { describe, test, expect, vi, beforeEach } from "vitest";
 
 vi.mock("./pdf-pages.js", () => ({ readPdfPages: vi.fn() }));
 
-import { readPdfPages } from "./pdf-pages.js";
 import { SyncError } from "@omnesis/types";
+import { readPdfPages } from "./pdf-pages.js";
 import { extractPdfText } from "./extract-pdf.js";
 import type { OcrFn } from "@omnesis/core";
 

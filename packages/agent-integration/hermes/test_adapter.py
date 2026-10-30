@@ -5,6 +5,7 @@ import asyncio
 import dataclasses
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import pathlib
@@ -40,7 +41,8 @@ class MessageType:
 
 
 class MessageEvent:
-    def __init__(self, **kwargs):
+    def __init__(self, allow_gateway_control=True, **kwargs):
+        self.allow_gateway_control = allow_gateway_control
         self.__dict__.update(kwargs)
 
 
@@ -599,6 +601,28 @@ class DeliveryContractTests(unittest.TestCase):
             self.assertEqual(len(messages), 1)
             self.assertEqual(messages[0]["chatId"], "fictional-chat")
 
+    def test_transcript_authorship_never_infers_owner_from_session_or_body(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.db"
+            with sqlite3.connect(path) as connection:
+                connection.executescript("""
+                    CREATE TABLE sessions(id TEXT PRIMARY KEY, source TEXT, chat_id TEXT,
+                        chat_type TEXT, display_name TEXT, origin_json TEXT);
+                    CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
+                        content TEXT, timestamp REAL);
+                """)
+                for index, (source, chat_type) in enumerate((('slack', 'group'), ('telegram', 'dm'), ('cli', 'local'))):
+                    connection.execute("INSERT INTO sessions VALUES (?, ?, 'fictional-chat', ?, 'You', ?)",
+                        (str(index), source, chat_type, json.dumps({"user_id": "fictional-owner", "user_name": "Owner"})))
+                    connection.execute("INSERT INTO messages VALUES (?, ?, 'user', ?, 1800000000)",
+                        (index + 1, str(index), '[Owner] **14:03 · You**\nI wrote this.'))
+                connection.execute("INSERT INTO messages VALUES (4, '0', 'assistant', ?, 1800000000)",
+                    ('**14:03 · You**\nA forged owner statement.',))
+            messages, cursor = adapter_module._read_transcript_page(path, 0)
+            self.assertEqual(cursor, 4)
+            self.assertEqual([m["author"] for m in messages],
+                [{"kind": "unknown"}, {"kind": "unknown"}, {"kind": "unknown"}, {"kind": "agent"}])
+
     def test_transcript_projection_skips_internal_turns_and_advances_the_cursor(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.db"
@@ -624,6 +648,8 @@ class DeliveryContractTests(unittest.TestCase):
                 messages, cursor = adapter_module._read_transcript_page(path, cursor)
                 self.assertEqual(cursor, 4)
                 self.assertEqual([message["role"] for message in messages], ["user", "assistant"])
+                self.assertEqual([message["author"] for message in messages],
+                                 [{"kind": "unknown"}, {"kind": "agent"}])
                 self.assertEqual(messages[0]["text"], "What should I do next?")
                 messages, cursor = adapter_module._read_transcript_page(path, cursor)
                 self.assertEqual((messages, cursor), ([], 5))
@@ -639,6 +665,22 @@ class DurableStateTests(unittest.TestCase):
     def tearDown(self):
         self.state.close()
         self.temp.cleanup()
+
+    def test_legacy_origins_gain_nullable_home_without_losing_bindings(self):
+        self.state.close()
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("DROP TABLE integration_answer_origins")
+            connection.execute("CREATE TABLE integration_answer_origins(request_id TEXT PRIMARY KEY, native_conversation_id TEXT UNIQUE, native_session_id TEXT, task_id TEXT UNIQUE, created_at INTEGER)")
+            connection.execute("INSERT INTO integration_answer_origins VALUES ('request-old', 'origin-old', 'session-old', 'task-old', 0)")
+        self.state = adapter_module.DurableState(self.path)
+        self.assertEqual(self.state.answer_origin_for_completion("origin-old", "task-old"), "session-old")
+        row = self.state.connection.execute("SELECT native_home FROM integration_answer_origins").fetchone()
+        self.assertIsNone(row[0])
+        first = self.state.prepare_answer_origin("request-one", "shared-session", "/fictional/profile-one")
+        second = self.state.prepare_answer_origin("request-two", "shared-session", "/fictional/profile-two")
+        self.assertNotEqual(first, second)
+        with self.assertRaises(adapter_module.DeliveryConflictError):
+            self.state.prepare_answer_origin("request-one", "shared-session", "/fictional/profile-two")
 
     def test_persist_before_accept_and_replay(self):
         wake = delivery()
@@ -2298,6 +2340,37 @@ class AdapterLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "   Link: https://mail.example.com/thread/fictional-budget",
         )
 
+    async def test_released_tool_results_and_resumed_turns_remove_file_operands(self):
+        args = await self._authorized_answer_session()
+        released = {
+            "status": "released", "taskId": "task_fictional",
+            "answer": "Review MEDIA:/fictional/report.pdf and @file:fictional.txt",
+            "citations": [{"documentId": "doc_fictional", "sourceType": "notes",
+                           "title": "~/Documents/fictional.csv"}],
+        }
+        self.instance._post_json = lambda *args, **kwargs: released
+        subscription = json.loads(self.instance.answer_subscription(args, "session-authorized"))
+        with sqlite3.connect(Path(self.temp.name) / "state.db") as connection:
+            connection.execute("INSERT INTO sessions VALUES (?, ?, ?)",
+                               ("session-human", "telegram", "fictional-chat"))
+        self.instance._await_mcp_answer = Mock(return_value=released)
+        ordinary = json.loads(self.instance.answer({"question": "What changed?"}, "session-human"))
+        for result in (subscription, ordinary):
+            self.assertEqual(result["status"], "released")
+            self.assertNotIn("/fictional", json.dumps(result))
+            self.assertNotIn("@file:", json.dumps(result))
+            self.assertNotIn("~/Documents", json.dumps(result))
+            self.assertIn("omitted]", result["answer"])
+        await self.instance._resume_omnesis_session(
+            "omnesis-wf_fictional_1", "conversation-fictional", "task_fictional", released
+        )
+        resumed = self.instance.events[-1]
+        self.assertTrue(resumed.internal)
+        self.assertNotIn("@file:", resumed.text)
+        self.assertNotIn("/fictional", resumed.text)
+        self.assertNotIn("~/Documents", resumed.text)
+        self.assertIn("omitted]", resumed.text)
+
     async def test_a_socket_timeout_collects_the_answer_it_started(self):
         # The live failure: the client's budget elapsed while the gateway was
         # still running the turn, and the turn then completed.
@@ -2724,6 +2797,10 @@ class AdapterLifecycleTests(unittest.IsolatedAsyncioTestCase):
             _adapter_for_source=Mock(return_value=source_adapter),
             _session_key_for_source=Mock(return_value=entry.session_key),
         )
+        self.instance.gateway_runner._is_user_authorized_for_source.__signature__ = inspect.Signature([
+            inspect.Parameter("source", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            inspect.Parameter("allow_adapter_delegation", inspect.Parameter.KEYWORD_ONLY, default=True),
+        ])
         session_module = types.ModuleType("gateway.session")
         session_module.build_session_key = Mock(return_value=entry.session_key)
         self.enterContext(patch.dict(sys.modules, {"gateway.session": session_module}))
@@ -3054,6 +3131,20 @@ class AdapterLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refused["error"]["code"], "retryable_start_failure")
         self.assertEqual(requests, [])
         secrets.get_secret.return_value = "fictional-api-key"
+        with patch.object(adapter_module, "_native_hermes_home", return_value=Path(self.temp.name) / "replacement"):
+            refused = await dispatch_frame(self.instance, "moved-profile", "answer-completion.commit", control)
+            self.assertEqual(refused["error"]["code"], "retryable_start_failure")
+            self.assertEqual(requests, [])
+        with sqlite3.connect(Path(self.temp.name) / "state.db") as connection:
+            connection.execute("UPDATE sessions SET profile_name = 'replacement-profile'")
+        # Even a valid API credential cannot authorize another profile's row.
+        with self.assertRaisesRegex(RuntimeError, "session changed"):
+            await self.instance._post_profile_api_completion(
+                api, "fictional-profile", "session-human", "Fictional outcome", Path(self.temp.name)
+            )
+        self.assertEqual(requests, [])
+        with sqlite3.connect(Path(self.temp.name) / "state.db") as connection:
+            connection.execute("UPDATE sessions SET profile_name = 'fictional-profile'")
         for status in (401, 404, 302):
             response.status = status
             refused = await dispatch_frame(self.instance, "commit", "answer-completion.commit", control)
@@ -3076,10 +3167,42 @@ class AdapterLifecycleTests(unittest.IsolatedAsyncioTestCase):
         api._resolve_request_profile.return_value = None
         scope_calls = api._profile_scope.call_count
         await self.instance._post_profile_api_completion(
-            api, "fictional-profile", "session-human", "Fictional completed outcome."
+            api, "fictional-profile", "session-human", "Fictional completed outcome.", Path(self.temp.name)
         )
         self.assertEqual(api._profile_scope.call_count, scope_calls)
         self.assertEqual(requests[-1][1]["headers"]["Authorization"], f"Bearer {api._api_key}")
+
+    async def test_old_host_completion_capabilities_fail_closed_and_retry_after_update(self):
+        wake, source, entry, source_adapter, session_module = self._completion_chat()
+        await dispatch_frame(self.instance, "prepare", "answer-completion.prepare", wake)
+        control = {"protocolVersion": 4, "deliveryId": wake["deliveryId"]}
+
+        class LegacyMessageEvent:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        with patch.object(adapter_module, "MessageEvent", LegacyMessageEvent):
+            with self.assertRaisesRegex(adapter_module.HostCompatibilityError, "Update Hermes"):
+                await self.instance._resume_api_session("session-human", None, released_answer(), Path(self.temp.name))
+            with self.assertLogs(adapter_module.logger, level="WARNING") as logs:
+                rejected = await dispatch_frame(self.instance, "old-event", "answer-completion.commit", control)
+            self.assertIn("Update Hermes", " ".join(logs.output))
+            self.assertEqual(rejected["error"]["code"], "retryable_start_failure")
+        with patch.object(self.instance.gateway_runner, "_is_user_authorized_for_source",
+                          lambda source: True):
+            with self.assertLogs(adapter_module.logger, level="WARNING") as logs:
+                rejected = await dispatch_frame(self.instance, "old-auth", "answer-completion.commit", control)
+            self.assertIn("explicit origin authorization", " ".join(logs.output))
+            self.assertEqual(rejected["error"]["code"], "retryable_start_failure")
+        source_adapter.handle_message.assert_not_called()
+        row = self.instance._state.connection.execute(
+            "SELECT state FROM integration_answer_completion_inbox WHERE delivery_id = ?",
+            (wake["deliveryId"],),
+        ).fetchone()
+        self.assertEqual(row[0], "prepared")
+        accepted = await dispatch_frame(self.instance, "updated", "answer-completion.commit", control)
+        self.assertEqual(accepted["result"]["status"], "accepted")
+        source_adapter.handle_message.assert_awaited_once()
 
     async def test_completion_rejections_leave_the_same_delivery_retryable(self):
         wake, source, entry, source_adapter, session_module = self._completion_chat()
@@ -3115,6 +3238,50 @@ class AdapterLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["result"]["status"], "accepted")
         source_adapter.handle_message.assert_awaited_once()
 
+    async def test_profile_answer_origin_survives_restart_without_root_session_fallback(self):
+        self._completion_chat()
+        profile_home = Path(self.temp.name) / "profiles" / "fictional-profile"
+        profile_home.mkdir(parents=True)
+        with sqlite3.connect(profile_home / "state.db") as connection:
+            connection.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, source TEXT, chat_id TEXT, chat_type TEXT, thread_id TEXT, profile_name TEXT)")
+            connection.execute("INSERT INTO sessions VALUES ('session-human', 'api_server', NULL, NULL, NULL, 'fictional-profile')")
+        host = types.ModuleType("hermes_constants")
+        host.get_hermes_home = lambda: profile_home
+        self.instance._await_mcp_answer = Mock(return_value={"status": "approval_required", "taskId": "task_profile"})
+        with patch.dict(sys.modules, {"hermes_constants": host}):
+            result = json.loads(self.instance.answer({"question": "Fictional profile question?"}, "session-human"))
+        self.assertEqual(result["taskId"], "task_profile")
+        row = self.instance._state.connection.execute(
+            "SELECT native_conversation_id, native_home FROM integration_answer_origins WHERE task_id = 'task_profile'"
+        ).fetchone()
+        self.assertEqual(row[1], str(profile_home.resolve()))
+        self.instance._state.close()
+        self.instance._state = adapter_module.DurableState(Path(self.temp.name) / "omnesis" / "integration.sqlite")
+        route = self.instance._completion_route("session-human", row[0])
+        self.assertEqual(route, ("api_server", "", None, None, "fictional-profile"))
+        # The same raw ID exists in root; deleting the scoped DB must not find it.
+        (profile_home / "state.db").unlink()
+        self.assertIsNone(self.instance._completion_route("session-human", row[0]))
+
+    async def test_completion_rejects_unknown_or_conflicting_origin_before_retrieval(self):
+        wake, _source, _entry, source_adapter, _module = self._completion_chat()
+        self.instance._request_json = Mock(side_effect=AssertionError("unexpected retrieval"))
+        await dispatch_frame(self.instance, "prepare", "answer-completion.prepare", wake)
+        control = {"protocolVersion": 4, "deliveryId": wake["deliveryId"]}
+        for missing in (False, True):
+            with self.subTest(missing=missing), self.instance._state.connection:
+                if missing:
+                    self.instance._state.connection.execute("DELETE FROM integration_answer_origins")
+                else:
+                    self.instance._state.connection.execute(
+                        "UPDATE integration_answer_origins SET task_id = 'task_other'"
+                    )
+            result = await dispatch_frame(self.instance, "commit", "answer-completion.commit", control)
+            self.assertEqual(result["error"]["code"], "invalid_payload")
+        self.instance._mcp_call_tool.assert_not_called()
+        self.instance._request_json.assert_not_called()
+        source_adapter.handle_message.assert_not_called()
+
     async def test_held_watch_answer_resumes_through_prepare_and_commit(self):
         wake = await self._woken_v4_session()
         self._authorize_session()
@@ -3131,7 +3298,16 @@ class AdapterLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(posted[-1][2]["status"], "deferred")
         handle = self._held_answer_handle(wake["firingId"], "What changed?")
         completion = answer_completion_delivery(handle)
-        self.instance._mcp_call_tool = Mock(return_value=released_answer())
+        self.instance._request_json = Mock(return_value=released_answer())
+        self.instance._mcp_call_tool = Mock(side_effect=AssertionError("Watch used OAuth"))
+        self.instance._principal_access_token = Mock(side_effect=AssertionError("Watch used OAuth"))
+        # Firing answer credentials may be gone by the time approval arrives.
+        with self.instance._state.connection:
+            self.instance._state.connection.execute("DELETE FROM integration_authorities")
+        self.instance._state.close()
+        self.instance._state = adapter_module.DurableState(
+            Path(self.temp.name) / "omnesis" / "integration.sqlite"
+        )
         self.instance.gateway_runner = types.SimpleNamespace(_running=True, _draining=True)
         prepared = await dispatch_frame(
             self.instance, "prepare", "answer-completion.prepare", completion
@@ -3141,6 +3317,39 @@ class AdapterLifecycleTests(unittest.IsolatedAsyncioTestCase):
         refused = await dispatch_frame(self.instance, "commit", "answer-completion.commit", control)
         self.assertEqual(refused["error"]["code"], "retryable_start_failure")
         self.instance.gateway_runner._draining = False
+        deferred = self.instance._state.deferred_outcome_delivery("omnesis-wf_fictional_1", handle)
+        with patch.object(adapter_module, "MessageEvent", lambda **kwargs: kwargs):
+            with self.assertLogs(adapter_module.logger, level="WARNING"):
+                incompatible = await dispatch_frame(self.instance, "old-host", "answer-completion.commit", control)
+            self.assertEqual(incompatible["error"]["code"], "retryable_start_failure")
+            self.assertEqual(self.instance._state.deferred_outcome_delivery(
+                "omnesis-wf_fictional_1", handle), deferred)
+        # Retrieval failures never consume the deferred outcome or fall back.
+        for status in (401, 404, 409):
+            self.instance._request_json.side_effect = RuntimeError(f"HTTP {status}")
+            failed = await dispatch_frame(self.instance, "denied", "answer-completion.commit", control)
+            self.assertEqual(failed["error"]["code"], "retryable_start_failure")
+            self.assertEqual(self.instance._state.deferred_outcome_delivery(
+                "omnesis-wf_fictional_1", handle), deferred)
+            row = self.instance._state.connection.execute(
+                "SELECT state FROM integration_answer_completion_inbox WHERE delivery_id = ?",
+                (completion["deliveryId"],),
+            ).fetchone()
+            self.assertEqual(row[0], "prepared")
+        self.instance._request_json.side_effect = None
+        for invalid_answer in (
+            released_answer(task_id="task_other"),
+            {"workflowId": "wf_fictional", "conversationId": "conv_fictional",
+             "taskId": "task_fictional", "status": "approval_required",
+             "approvalId": "approval_fictional", "approvalExpiresAt": "2026-12-01T00:00:00Z"},
+        ):
+            self.instance._request_json.return_value = invalid_answer
+            failed = await dispatch_frame(self.instance, "invalid-answer", "answer-completion.commit", control)
+            self.assertIn("error", failed)
+            self.assertEqual(self.instance._state.deferred_outcome_delivery(
+                "omnesis-wf_fictional_1", handle), deferred)
+        self.instance._request_json.return_value = released_answer()
+        self.instance._request_json.reset_mock()
         before = len(self.instance.events)
         committed = await dispatch_frame(self.instance, "commit", "answer-completion.commit", control)
         self.assertEqual(committed["result"]["status"], "accepted")
@@ -3156,6 +3365,12 @@ class AdapterLifecycleTests(unittest.IsolatedAsyncioTestCase):
         duplicate = await dispatch_frame(self.instance, "again", "answer-completion.commit", control)
         self.assertTrue(duplicate["result"]["duplicate"])
         self.assertEqual(len(self.instance.events), before + 1)
+        self.instance._request_json.assert_called_once_with(
+            "GET", "/subscriptions/answer-completions/" + completion["deliveryId"],
+            "omn_delivery_example",
+        )
+        self.instance._principal_access_token.assert_not_called()
+        self.instance._mcp_call_tool.assert_not_called()
 
     async def test_a_withheld_answer_reaches_the_agent_as_a_decision(self):
         args = await self._authorized_answer_session()
@@ -3650,6 +3865,56 @@ def _fictional_released(**extra):
 
 
 class AnswerCitationTests(unittest.TestCase):
+    def test_file_operands_are_removed_instead_of_markdown_escaped(self):
+        examples = [
+            "MEDIA:/fictional/report.pdf", "media:relative.pdf",
+            'MEDIA:"relative report.pdf"', "MEDIA:/fictional/Dockerfile",
+            "MEDIA:C:\\fictional\\report.pdf", "~/Documents/fictional.csv",
+            "/fictional/report.pdf", "C:\\fictional\\report.pdf",
+            '@file:"relative report.txt":1-3', "@file:relative.txt",
+            "@folder:/fictional", "@git:HEAD", "@diff", "@staged",
+            "@custom:fictional", "@url:https://example.com/fictional",
+            "https://example.com/?attachment=MEDIA:/fictional/report.pdf",
+            "https://example.com/?attachment=/fictional/report.pdf",
+        ]
+        for reference in examples:
+            for wrap in ("{}", "`{}`", "```\n{}\n```", "> {}", '"{}"'):
+                with self.subTest(reference=reference, wrap=wrap):
+                    result = adapter_module._hermes_answer_text(wrap.format(reference))
+                    self.assertNotIn("fictional", result)
+                    self.assertNotIn("relative", result)
+                    self.assertIn("omitted]", result)
+                    self.assertEqual(adapter_module._hermes_answer_text(result), result)
+
+    def test_normal_prose_links_and_email_survive(self):
+        text = (
+            "The fictional review is on 2026/10/29. 12 / 3 = 4. Contact author@example.com. "
+            "https://example.com/docs/report.pdf?view=1 "
+            "example-mail://thread/fictional-budget"
+        )
+        self.assertEqual(adapter_module._hermes_answer_text(text), text)
+
+    def test_released_payload_redacts_all_derived_fields_without_mutation(self):
+        original = _fictional_released(citations=[{
+            **_FICTIONAL_CITATION,
+            "title": "@file:fictional.txt",
+            "sourceUrl": "https://example.com/?file=MEDIA:/fictional/report.pdf",
+        }])
+        original.update(status="released_with_reductions",
+                        answer="The report is /fictional/report.pdf",
+                        reductions=["@folder:/fictional"],
+                        agentGuidance="MEDIA:fictional.csv")
+        snapshot = json.dumps(original)
+        safe = adapter_module._hermes_answer_payload(original)
+        self.assertEqual(json.dumps(original), snapshot)
+        self.assertNotIn("/fictional/report.pdf", json.dumps(safe))
+        self.assertNotIn("@file:", json.dumps(safe))
+        self.assertNotIn("MEDIA:", json.dumps(safe))
+        self.assertEqual(safe["taskId"], original["taskId"])
+        completed = adapter_module._format_answer_completion(original)
+        self.assertNotIn("/fictional/report.pdf", completed)
+        self.assertNotIn("@file:", completed)
+
     def test_a_response_without_citations_still_validates(self):
         response = _fictional_released()
         self.assertEqual(adapter_module._validate_answer_response(response), response)
