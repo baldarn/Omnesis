@@ -28,6 +28,7 @@
     { "path": "packages/providers/github" },
     { "path": "packages/providers/google" },
     { "path": "packages/providers/granola" },
+    { "path": "packages/providers/paperless" },
     { "path": "packages/providers/hermes" },
     { "path": "packages/providers/imap" },
     { "path": "packages/providers/local-files" },

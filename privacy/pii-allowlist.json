@@ -12389,6 +12389,34 @@
       "value": "Stellar Sound Bot",
       "paths": ["packages/providers/telegram/src/testing/fixtures.ts"],
       "reason": "invented Telegram fixture name from the CLAUDE.md example set (people, venues and vendors), not corpus data."
+    },
+    {
+      "value": "Stellar Energy",
+      "paths": [
+        "packages/providers/paperless/src/documents.test.ts",
+        "packages/providers/paperless/src/normalizer.test.ts"
+      ],
+      "reason": "reviewed invented demo fixture"
+    },
+    {
+      "value": "Riverside Clinic",
+      "paths": ["packages/providers/paperless/src/document-event-profile.test.ts"],
+      "reason": "reviewed invented demo fixture"
+    },
+    {
+      "value": "Northstar Insurance",
+      "paths": ["packages/providers/paperless/src/documents.test.ts"],
+      "reason": "reviewed invented demo fixture"
+    },
+    {
+      "value": "Connect Paperless",
+      "paths": ["packages/providers/paperless/src/provider.test.ts"],
+      "reason": "the Paperless-ngx connect dialog's title, not a person"
+    },
+    {
+      "value": "No Paperless",
+      "paths": ["packages/providers/paperless/src/provider.test.ts"],
+      "reason": "the start of a Paperless-ngx error message, not a person"
     }
   ],
   "secretFixtures": [

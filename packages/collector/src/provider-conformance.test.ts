@@ -185,6 +185,17 @@ const current: Record<string, unknown> = {
     pageCursor: "page-2",
     syncedUpTo: timestamp,
   },
+  "paperless-documents": {
+    phase: "snapshot",
+    watermark: timestamp,
+    sweepWatermark: timestamp,
+    pending: [7, 3],
+    lookups: { t1: "0a1b2c3d4e", c10: "5f6a7b8c9d" },
+    known: { "3": "", "7": "1e2d3c4b5a", "9": "" },
+    skipped: [5],
+    lastSnapshotAt: timestamp,
+    snapshot: { ids: { documents: ["3", "7", "9"] } },
+  },
   plaid: { phase: "transactions", transactionsCursor: "page-2", lastSnapshotDate: "2026-01-02" },
   "telegram-messages": { phase: "incremental", committedSeq: 42, storeId: "store-1" },
   "whatsapp-messages": {
@@ -208,6 +219,35 @@ const historical: Record<string, unknown> = {
 // Other cursors an install could hold besides the current fixture. Each must
 // resume as itself, whether stored bare or in the envelope the host writes.
 const installed: Record<string, Record<string, Record<string, unknown>>> = {
+  "paperless-documents": {
+    // Between sweeps: nothing pending, the watermark settled.
+    settled: {
+      phase: "incremental",
+      watermark: timestamp,
+      lookups: { t1: "0a1b2c3d4e" },
+      known: { "3": "" },
+      lastSnapshotAt: timestamp,
+    },
+    // Partway through the first full sweep, before any watermark exists.
+    bootstrap: {
+      phase: "full",
+      sweepWatermark: timestamp,
+      pending: [3],
+      lookups: { t1: "0a1b2c3d4e" },
+      known: { "1": "", "3": "" },
+      snapshot: { ids: { documents: ["1", "3"] } },
+    },
+    // Partway through a changes-only sweep that ran past one page.
+    midIncremental: {
+      phase: "incremental",
+      watermark: timestamp,
+      sweepWatermark: timestamp,
+      pending: [5],
+      lookups: { t1: "0a1b2c3d4e" },
+      known: { "3": "" },
+      lastSnapshotAt: timestamp,
+    },
+  },
   "telegram-messages": {
     // Mid-way through the history walk: the drain acknowledges during bootstrap.
     bootstrap: { phase: "bootstrap", committedSeq: 17, storeId: "store-1" },
@@ -251,6 +291,9 @@ const incompatible: Record<string, unknown> = {
   "claude-code": { ...agentCursor, version: 999 },
   codex: { ...agentCursor, version: 999 },
   pi: { ...agentCursor, version: 999 },
+  // A sweep in progress without what it has listed would end by vouching for
+  // an empty archive.
+  "paperless-documents": { phase: "snapshot", watermark: timestamp, pending: [7, 3] },
 };
 
 function options(id: string, version?: number): SourceConformanceOptions {
