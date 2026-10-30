@@ -14,10 +14,10 @@
  * gateway forwards them to subscribers (SSE on the admin client side).
  */
 
-import { hostname as osHostname } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
   KEYRING_ENV_KEYS,
+  collectorHostname,
   createLogger,
   toErrorMessage,
   hasProviderCredentials,
@@ -211,7 +211,7 @@ export function createSourceWsHandlers(deps: SourceWsHandlerDeps): SourceWsHandl
         .getDescriptors()
         .filter((d) => !d.gatewayHosted)
         .map(serializeDescriptor),
-      hostname: osHostname(),
+      hostname: collectorHostname(),
     };
   }
 
@@ -858,7 +858,7 @@ export function createSourceWsHandlers(deps: SourceWsHandlerDeps): SourceWsHandl
   }
 
   function handleCredentialsStatus(): WsResponsePayload<"credentials.status"> {
-    return { hostname: osHostname(), entries: listCredentialEntries() };
+    return { hostname: collectorHostname(), entries: listCredentialEntries() };
   }
 
   async function handleCredentialsSet(
