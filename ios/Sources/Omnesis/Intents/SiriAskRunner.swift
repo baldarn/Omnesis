@@ -87,38 +87,86 @@ struct SiriAskRunner {
         self.onActivity = onActivity
     }
 
+    struct CaptureResult: Sendable {
+        let outcome: SiriAskOutcome
+        let conversationId: String?
+        let messageId: String?
+        let notifyLocally: Bool
+    }
+
+    private struct SentResult: Sendable {
+        let outcome: SiriAskOutcome
+        let messageId: String?
+        let notifyLocally: Bool
+    }
+
+    private struct CaptureDelivery {
+        let durable: Bool
+        let completionNotifications: Bool
+    }
+
     /// Run one ask. `question` must already be non-empty and trimmed —
     /// the intents guard emptiness so Siri can re-prompt for the value.
     func run(question: String) async -> SiriAskOutcome {
-        // The budget clock starts here, before the first round trip — see
-        // `answerBudget`.
+        await runCapture(question: question, durableCapture: false).outcome
+    }
+
+    /// Complication audio is already accepted durably. If the previous turn
+    /// is busy, post this question in a new conversation instead of losing it.
+    func runCapture(
+        question: String,
+        durableCapture: Bool = true,
+        completionNotifications: Bool = false,
+        resuming: String? = nil
+    ) async
+        -> CaptureResult {
         let startedAt = now()
         guard let pairing = (try? pairing.current()).flatMap({ $0 }) else {
-            return .notPaired
+            return CaptureResult(outcome: .notPaired, conversationId: nil, messageId: nil, notifyLocally: true)
         }
         let client = makeClient(pairing.url, pairing.token)
         onActivity?(.connecting)
-        let session: CreateSessionResponse
-        switch await openSession(client, resumeFromId: continuity.conversationToResume(), within: budget) {
-        case .ended(let outcome): return outcome
+        var session: CreateSessionResponse
+        switch await openSession(
+            client,
+            resumeFromId: resuming ?? continuity.conversationToResume(),
+            within: budget,
+            strictResume: resuming != nil
+        ) {
+        case .ended(let outcome): return CaptureResult(outcome: outcome, conversationId: nil, messageId: nil, notifyLocally: true)
         case .opened(let opened): session = opened
         }
-        switch SiriAskPreflight.action(for: session) {
-        case .reportPreviousTurnRunning(let conversationId):
-            // The previous ask's turn is still running — its own armed
-            // push delivers that answer. Refresh the continuity stamp so
-            // the promised follow-up resumes this same thread.
-            continuity.record(conversationId: conversationId)
-            return .previousTurnRunning
-        case .send(let conversationId):
-            return await send(
-                question: question,
-                client: client,
-                session: session,
+        if case .reportPreviousTurnRunning(let conversationId) = SiriAskPreflight.action(for: session) {
+            if resuming != nil { return CaptureResult(
+                outcome: .failed(reason: "Your follow-up was not sent because this conversation is still busy. Please ask again shortly."),
                 conversationId: conversationId,
-                startedAt: startedAt
-            )
+                messageId: nil,
+                notifyLocally: true
+            ) }
+            guard durableCapture else {
+                continuity.record(conversationId: conversationId)
+                return CaptureResult(outcome: .previousTurnRunning, conversationId: conversationId, messageId: nil, notifyLocally: false)
+            }
+            let remaining = max(0, budget - now().timeIntervalSince(startedAt))
+            switch await openSession(client, resumeFromId: nil, within: remaining) {
+            case .ended(let outcome): return CaptureResult(outcome: outcome, conversationId: nil, messageId: nil, notifyLocally: true)
+            case .opened(let opened): session = opened
+            }
         }
+        let conversationId = session.conversationId ?? session.sessionId
+        let sent = await send(
+            question: question,
+            client: client,
+            session: session,
+            startedAt: startedAt,
+            delivery: CaptureDelivery(durable: durableCapture, completionNotifications: completionNotifications)
+        )
+        return CaptureResult(
+            outcome: sent.outcome,
+            conversationId: conversationId,
+            messageId: sent.messageId,
+            notifyLocally: sent.notifyLocally
+        )
     }
 
     /// Ask a question nobody is waiting on: one the watch queued after the
@@ -144,7 +192,7 @@ struct SiriAskRunner {
     /// did settle inside the push budget reads the same only when the stream
     /// missed its end and the transcript read-back failed too; its answer is
     /// then in the conversation without a notification.
-    func handOff(question: String) async -> (outcome: SiriAskOutcome, conversationId: String?) {
+    func handOff(question: String, resuming: String? = nil) async -> (outcome: SiriAskOutcome, conversationId: String?) {
         let startedAt = now()
         guard let pairing = (try? pairing.current()).flatMap({ $0 }) else {
             return (.notPaired, nil)
@@ -154,11 +202,20 @@ struct SiriAskRunner {
         // background time a queued relay's launch is granted.
         let left = { max(0, budget - now().timeIntervalSince(startedAt)) }
         var session: CreateSessionResponse
-        switch await openSession(client, resumeFromId: continuity.conversationToResume(), within: left()) {
+        switch await openSession(
+            client,
+            resumeFromId: resuming ?? continuity.conversationToResume(),
+            within: left(),
+            strictResume: resuming != nil
+        ) {
         case .ended(let outcome): return (outcome, nil)
         case .opened(let opened): session = opened
         }
         if case .reportPreviousTurnRunning = SiriAskPreflight.action(for: session) {
+            if resuming != nil { return (
+                .failed(reason: "Your follow-up was not sent because this conversation is still busy. Please ask again shortly."),
+                session.conversationId ?? session.sessionId
+            ) }
             // A live ask would tell its caller to try again; nobody is here to
             // hear that, so the question goes to a fresh conversation instead
             // of being dropped behind the running one.
@@ -207,17 +264,18 @@ struct SiriAskRunner {
     private func openSession(
         _ client: AgentClient,
         resumeFromId: String?,
-        within seconds: TimeInterval
+        within seconds: TimeInterval,
+        strictResume: Bool = false
     ) async
         -> OpenedSession {
-        switch await Self.beforeDeadline(seconds, { await Self.voiceSession(client, resumeFromId) }) {
+        switch await Self.beforeDeadline(seconds, { await Self.voiceSession(client, resumeFromId, strictResume: strictResume) }) {
         case .timedOut:
             .ended(.unreachable)
         case .finished(.failure(GatewayClient.Error.forbidden)),
              .finished(.failure(GatewayClient.Error.unauthorized)):
             .ended(.unauthorized)
         case .finished(.failure):
-            .ended(.unreachable)
+            .ended(strictResume ? .failed(reason: "Couldn't reopen that conversation. Try again or start a new question.") : .unreachable)
         case .finished(.success(let created)):
             .opened(created)
         }
@@ -228,6 +286,13 @@ struct SiriAskRunner {
     private final class PostedFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var posted = false
+        private var postedMessageId: String?
+
+        var messageId: String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return postedMessageId
+        }
 
         var value: Bool {
             lock.lock()
@@ -235,9 +300,10 @@ struct SiriAskRunner {
             return posted
         }
 
-        func set() {
+        func set(messageId: String? = nil) {
             lock.lock()
             posted = true
+            postedMessageId = messageId
             lock.unlock()
         }
     }
@@ -253,10 +319,13 @@ struct SiriAskRunner {
         question: String,
         client: AgentClient,
         session: CreateSessionResponse,
-        conversationId: String,
-        startedAt: Date
+        startedAt: Date,
+        delivery: CaptureDelivery
     ) async
-        -> SiriAskOutcome {
+        -> SentResult {
+        let conversationId = session.conversationId ?? session.sessionId
+        let durableCapture = delivery.durable
+        let completionNotifications = delivery.completionNotifications
         // Whatever reaching the gateway cost comes out of the budget, so the
         // spoken wait and the armed push both end when the caller's own
         // ceiling does.
@@ -272,13 +341,16 @@ struct SiriAskRunner {
         // the still-working dialog rather than a failure: the send's
         // `notifyAfterMs` armed a push for exactly this wait, so a turn
         // whose answer this ask never sees is still delivered.
+        let posted = PostedFlag()
         let pending = PendingTurn(
             question: question,
             client: client,
             session: session,
             conversationId: conversationId,
             remaining: remaining,
-            viewingForMs: Self.viewingForMs(remaining: remaining, settleGrace: settleGrace)
+            viewingForMs: durableCapture ? nil : Self.viewingForMs(remaining: remaining, settleGrace: settleGrace),
+            onPosted: { posted.set(messageId: $0) },
+            notificationRemaining: durableCapture ? (completionNotifications ? 0 : SiriAskBudget.minimumRemaining) : nil
         )
         let outcome = await Self.beforeDeadline(remaining + settleGrace) {
             await Self.turn(
@@ -293,8 +365,16 @@ struct SiriAskRunner {
             )
         }
         switch outcome {
-        case .timedOut: return .stillWorking
-        case .finished(let resolved): return resolved
+        case .timedOut: return SentResult(outcome: .stillWorking, messageId: posted.messageId, notifyLocally: false)
+        case .finished(let resolved):
+            switch resolved {
+            case .answered, .emptyAnswer, .failed:
+                return SentResult(outcome: resolved, messageId: posted.messageId, notifyLocally: durableCapture && !completionNotifications)
+            case .stillWorking, .previousTurnRunning:
+                return SentResult(outcome: resolved, messageId: posted.messageId, notifyLocally: false)
+            default:
+                return SentResult(outcome: resolved, messageId: posted.messageId, notifyLocally: true)
+            }
         }
     }
 
@@ -308,6 +388,8 @@ struct SiriAskRunner {
         /// The read-state lease for a caller presenting the answer as it is
         /// produced; nil when nothing is.
         let viewingForMs: Int?
+        var onPosted: (@Sendable (String) -> Void)?
+        var notificationRemaining: TimeInterval?
     }
 
     /// Post the question and fold the turn's stream into a spoken outcome.
@@ -332,12 +414,13 @@ struct SiriAskRunner {
             sent = try await client.sendMessage(
                 sessionId: session.sessionId,
                 text: question,
-                notifyAfterMs: SiriAskBudget.notifyAfterMs(remaining: remaining),
+                notifyAfterMs: pending.notificationRemaining.map { Int($0 * 1000) } ?? SiriAskBudget.notifyAfterMs(remaining: remaining),
                 viewingForMs: pending.viewingForMs
             )
         } catch {
             return .sendFailed
         }
+        pending.onPosted?(sent.messageId)
         onSent()
         let engine = VoiceAnswerEngine(
             sessionId: session.sessionId,
@@ -381,12 +464,14 @@ struct SiriAskRunner {
     /// `@Sendable` closure.
     private static func voiceSession(
         _ client: AgentClient,
-        _ resumeFromId: String?
+        _ resumeFromId: String?,
+        strictResume: Bool = false
     ) async
         -> Result<CreateSessionResponse, Error> {
         if let resumeFromId, let resumed = await resume(client, resumeFromId) {
             return .success(resumed)
         }
+        if strictResume { return .failure(GatewayClient.Error.invalidResponse) }
         do {
             return try await .success(client.createSession(profile: "voice"))
         } catch {

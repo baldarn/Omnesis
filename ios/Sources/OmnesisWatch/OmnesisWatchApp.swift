@@ -9,8 +9,8 @@ import WatchKit
 /// The Apple Watch companion app. It carries the "Ask Omnesis" and
 /// "Omnesis note" App Shortcuts so watch Siri recognises those phrases,
 /// and — because Siri hands over as soon as the intent opens the app — it
-/// presents the result itself. Its two complications open it at a link that
-/// starts dictation for their flow. Activating the WatchConnectivity session
+/// presents the result itself. Its logo complication opens the
+/// unified audio capture. Activating the WatchConnectivity session
 /// at launch means the relay is ready by the time the question or note
 /// arrives.
 @main
@@ -25,11 +25,14 @@ struct OmnesisWatchApp: App {
         WindowGroup {
             WatchRootView()
                 .onChange(of: scenePhase) { _, phase in
-                    if phase == .background { WatchDictation.appDidEnterBackground() }
+                    if phase == .background {
+                        WatchDictation.appDidEnterBackground()
+                        WatchComplicationCapture.shared.pause()
+                    }
                 }
                 .onOpenURL { url in
-                    guard let complication = WatchComplication(url: url) else { return }
-                    Task { await WatchDictation.start(complication) }
+                    guard WatchComplication(url: url) != nil else { return }
+                    Task { await WatchComplicationCapture.shared.start(fromComplication: true) }
                 }
             #if DEBUG
                 .watchDemoAutoPilot()
@@ -63,7 +66,9 @@ struct WatchRootView: View {
 
     var body: some View {
         Group {
-            if capture.state != .idle {
+            if WatchComplicationCapture.shared.state != .idle {
+                WatchComplicationCaptureView()
+            } else if capture.state != .idle {
                 WatchVoiceCaptureView()
             } else {
                 switch presenter.screen {
@@ -116,19 +121,22 @@ struct WatchAskView: View {
 
     private var idle: some View {
         VStack(spacing: 10) {
-            Image(systemName: "questionmark.bubble")
-                .font(.system(size: 34))
-                .foregroundStyle(.tint)
-            Text("Ask Omnesis")
-                .font(.headline)
+            Image("OmnesisMark")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 48, height: 48)
+                .foregroundStyle(Color(red: 88 / 255, green: 166 / 255, blue: 1))
+            Text("Omnesis").font(.headline)
             if hintVisible {
-                dictateButton("Ask")
-                    .transition(.opacity)
-                Text("Or say \u{201C}Ask Omnesis\u{201D} to Siri.")
-                    .font(.footnote)
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-                    .transition(.opacity)
+                Button {
+                    Task { await WatchComplicationCapture.shared.start() }
+                } label: {
+                    Label("Tap to speak", systemImage: "mic.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color(red: 88 / 255, green: 166 / 255, blue: 1))
+                .foregroundStyle(.black)
+                .transition(.opacity)
             }
         }
         .padding()
@@ -231,11 +239,11 @@ struct WatchAskView: View {
         .padding()
     }
 
-    /// Opens dictation for a new question — the in-app twin of the Ask
-    /// complication.
+    /// Follow-ups use the same audio-only recorder and explicitly ask;
+    /// they never invoke system dictation or the decision gate.
     private func dictateButton(_ title: LocalizedStringKey) -> some View {
         Button {
-            Task { await WatchDictation.start(.ask) }
+            Task { await WatchComplicationCapture.shared.start(followUp: true) }
         } label: {
             Label(title, systemImage: "mic.fill")
         }
@@ -274,7 +282,7 @@ struct WatchAskView: View {
                 Button {
                     speaker.replay()
                 } label: {
-                    Label("Replay", systemImage: "speaker.wave.2.fill")
+                    Label("Speak answer", systemImage: "speaker.wave.2.fill")
                 }
             }
         }

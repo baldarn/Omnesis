@@ -75,18 +75,53 @@ reported delivered — with the same retries, 7-day/50-note limit and dropped
 notice. The phone saves a note once by its ref, which is also its gateway
 note id. Questions keep their live relay.
 
-The watch also ships two complications, **Ask Omnesis** and **Omnesis note**,
-from the `OmnesisWatchWidgets` WidgetKit extension embedded in the watch app. A
-widget can only open its own app, so each complication is a `widgetURL` to its
-`WatchComplication` link (`Sources/Omnesis/Intents/WatchComplication.swift`,
-dual-membered into both watch targets); the app's `onOpenURL` hands it to
-`WatchDictation`, which presents WatchKit's system text input controller with
-**no suggestions and `.plain` mode**, the combination WatchKit documents as
-going straight to dictation (a suggestion list, even an empty one, or emoji
-mode shows the keyboard/Scribble picker first). SwiftUI `TextField` focus and
-`TextFieldLink` cannot do this, and a widget cannot cross-launch Shortcuts, so
-do not reach for either. Dictation does not run in the simulator, so the
-complication-to-dictation path can only be checked on a physical watch.
+The watch ships one **Omnesis** logo complication. Its link enters
+`WatchComplicationCapture`, separate from `WatchDictation` and both Siri intents.
+The recorder starts immediately without system dictation or live text, then
+Ask/Tell stop and durably enqueue the recording in one tap. The phone publishes
+unified-capture support and the gateway's decision-gate status in
+`WatchDictationGate`. With the decision gate active, Send replaces Ask/Tell.
+Legacy deep links enter the unified capture. Normal app launch shows a branded
+Tap to speak button that opens the same recorder; only the complication starts
+listening immediately. A Siri relay or in-app dictation dismisses the capture UI.
+Cancel from a complication-launched capture discards its recording and returns
+to the watch face; home capture Cancel stays in the app, and follow-up Cancel
+returns to the previous answer.
+Tell returns to the watch face after confirmation once WatchConnectivity owns
+the transfer. Automatic Send waits for a note classification before dismissal.
+Audio-only capture answers are opt-in via the playback control; Siri hand-over
+keeps its existing spoken reply. The answer's microphone opens
+this same recorder with a single Ask action, bypassing the decision gate. The
+recording carries the displayed answer's conversation id so a follow-up does
+not drift to another voice thread or expire with the short Siri continuity window.
+The Watch halo follows the iPhone Tell surface: two staggered expanding/fading
+ripples, with smoothed microphone energy changing only the light. Reduce Motion
+uses static rings; animations stop outside active recording.
+
+`WatchCapturePipeline` handles complication audio on the phone using
+`WatchVoiceInbox`. Ref-keyed state and completion receipts deduplicate transfers
+across restarts. Tell with gateway dictation hands a copy into the durable note
+pipeline immediately; Ask and automatic routing transcribe first, on the gateway
+when enabled and strictly on-device otherwise. The local recognizer uses the
+vocabulary cache and requires prior speech authorization, offered in Settings →
+Apple Watch. Failures retain the original recording for retry on activation;
+captures older than a week are reported and removed. Ambiguous Ask hand-offs are
+reported rather than automatically replayed. Explicit Ask uses the existing
+bounded answer runner. Correlated live and queued phone updates carry routing,
+progress and the answer back to the Watch. The gateway advertises
+`watchCapture.completionNotifications`; supported gateways accept
+`notifyAfterMs: 0` to arm a completion fallback without a viewing lease.
+The Watch acknowledges an actual displayed answer; the phone marks it seen
+with the accepted message id so the receipt survives a racing persistence write. The
+gateway gives this acknowledgement three seconds before notifying only if
+the answer remains unread. Older gateways retain the short hand-off and
+local notification fallback. The decision service defaults unknown
+or failed classifications to Ask. The gateway's
+`inference.dictation.useDecisionGateForWatch` opt-out restores two buttons.
+
+The Watch recorder requires microphone permission. Interruptions and recording
+limits stop into a ready state; only an explicit submission sends audio.
+WatchConnectivity and real microphone behavior still need physical-device QA.
 
 ### Screenshotting the watch ask — the wrist's self-critique loop
 

@@ -37,6 +37,7 @@ enum WatchDictation {
 
     static func start(_ complication: WatchComplication) async {
         guard !presenting else { return }
+        WatchComplicationCapture.shared.cancel()
         presenting = true
         generation += 1
         let current = generation
@@ -49,17 +50,23 @@ enum WatchDictation {
         // An answer still being read aloud would talk over the dictation.
         WatchSpeaker.shared.stop()
 
-        if complication == .note,
-           let limit = await WatchLink.shared.dictationGate()?.recordingLimit(now: Date()),
-           await WatchVoiceCapture.shared.start(limit: limit) {
-            presenting = false
-            return
+        if complication == .note {
+            let gate = await WatchLink.shared.dictationGate()
+            guard current == generation else { return }
+            if let limit = gate?.recordingLimit(now: Date()) {
+                let started = await WatchVoiceCapture.shared.start(limit: limit)
+                guard current == generation else { return }
+                if started {
+                    presenting = false
+                    return
+                }
+            }
         }
 
-        guard let controller = await visibleController() else {
+        let controller = await visibleController()
+        guard current == generation else { return }
+        guard let controller else {
             presenting = false
-            // Say so on the wrist rather than doing nothing: silence reads
-            // as a tap that never registered.
             WKInterfaceDevice.current().play(.failure)
             return
         }
@@ -67,7 +74,8 @@ enum WatchDictation {
             let text = results?.compactMap(Self.string(from:)).first?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             Task { @MainActor in
-                if current == generation { presenting = false }
+                guard current == generation else { return }
+                presenting = false
                 // Cancelling dictation leaves the flow's screen as it was.
                 guard let text, !text.isEmpty else { return }
                 submit(text, to: complication)
@@ -75,7 +83,16 @@ enum WatchDictation {
         }
     }
 
+    /// A different entry point owns the microphone. Pending permission,
+    /// activation and text-input callbacks cannot resurrect the old flow.
+    static func cancelPending() {
+        generation += 1
+        if presenting { WKApplication.shared().visibleInterfaceController?.dismissTextInputController() }
+        presenting = false
+    }
+
     static func appDidEnterBackground() {
+        generation += 1
         presenting = false
         WatchVoiceCapture.shared.appDidEnterBackground()
     }
